@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "pdf_studio (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "pdf_studio (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

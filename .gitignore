@@ -1,0 +1,24 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+# Visual Studio cache/options
+.vs/
+# Windows App Packaging
+AppPackages/
+BundleArtifacts/
+Package.StoreAssociation.xml
+*.appx
+*.appxbundle
+*.appxupload
+# User-specific files
+*.user
+*.suo
+*.rsuser
+# NuGet packages
+*.nupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+# Test results
+[Tt]est[Rr]esult*/

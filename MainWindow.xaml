@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="pdf_studio.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:pdf_studio"
+    xmlns:views="using:pdf_studio.Views"
+    Title="PDF Studio">
+
+    <Window.SystemBackdrop>
+        <MicaBackdrop />
+    </Window.SystemBackdrop>
+
+    <TabView x:Name="MainTabView"
+             AddTabButtonClick="OnAddTabButtonClick"
+             TabCloseRequested="OnTabCloseRequested"
+             VerticalAlignment="Stretch">
+    </TabView>
+</Window>
