@@ -278,10 +278,15 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         {
             lock (_cacheLock)
             {
-                foreach (var kvp in _highResCache)
+                for (var node = _highResCache.First; node != null; node = node.Next)
                 {
-                    if (kvp.Key == index)
-                        return kvp.Value;
+                    if (node.Value.Key == index)
+                    {
+                        var value = node.Value;
+                        _highResCache.Remove(node);
+                        _highResCache.AddLast(value);
+                        return value.Value;
+                    }
                 }
             }
 
