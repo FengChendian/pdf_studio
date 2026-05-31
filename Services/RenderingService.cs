@@ -69,6 +69,13 @@ namespace pdf_studio.Services
 
         public int PageCount => _PageCount;
 
+        public (double Width, double Height) GetPageSize(int pageNumber)
+        {
+            var page = _documents.LoadPage(pageNumber);
+            var rect = page.Rect;
+            return (rect.Width, rect.Height);
+        }
+
         public void Dispose()
         {
             _documents.Dispose();

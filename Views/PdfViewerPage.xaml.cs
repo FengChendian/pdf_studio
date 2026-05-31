@@ -60,6 +60,21 @@ public sealed partial class PdfViewerPage : Page
         //RenderPages();
     }
 
+    private bool _sizesCalculated = false;
+
+    private void PdfScrollViewer_SizeChanged(object sender, Microsoft.UI.Xaml.SizeChangedEventArgs e)
+    {
+        if (!_sizesCalculated && e.NewSize.Width > 0)
+        {
+            _sizesCalculated = true;
+            double availableWidth = e.NewSize.Width - 64; // ItemsRepeater margin (32 * 2)
+            if (availableWidth > 0)
+            {
+                VirtualizingImages.CalculateDisplaySizes(availableWidth);
+            }
+        }
+    }
+
     private void PdfScrollViewer_ViewChanged(ScrollView sender, object args)
     {
         //Debug.WriteLine($"ViewChanged, vertical offset {sender.VerticalOffset}");
@@ -90,13 +105,25 @@ public sealed partial class PdfViewerPage : Page
     }
 }
 
+public class PageImageItem
+{
+    public BitmapImage? Image { get; set; }
+    public double Width { get; set; } = double.NaN;
+    public double Height { get; set; } = double.NaN;
+    public double ContainerWidth { get; set; } = double.NaN;
+}
+
 public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChanged, IDisposable
 {
-    private readonly Dictionary<int, BitmapImage> _placeHolderCache = [];
-    private readonly LinkedList<KeyValuePair<int, BitmapImage>> _highResCache = new();
+    private readonly Dictionary<int, PageImageItem> _placeHolderCache = [];
+    private readonly LinkedList<KeyValuePair<int, PageImageItem>> _highResCache = new();
     private readonly object _cacheLock = new();
     private const int MaxHighResCacheSize = 5;
     private volatile int _currentRenderDpi = 300;
+    private readonly Dictionary<int, (double Width, double Height)> _pageSizes = [];
+    private double _normalizedHeight;
+    private readonly Dictionary<int, double> _displayWidths = [];
+    private double _containerWidth;
     private readonly HashSet<int> _pendingRequests = [];
     private readonly RenderingService _renderingService;
 
@@ -128,12 +155,58 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     {
         for (int i = 0; i < _renderingService.PageCount; i++)
         {
+            _pageSizes[i] = _renderingService.GetPageSize(i);
             var bitmap = await _renderingService.RenderPageToBitmap(i, 72);
             if (bitmap != null)
             {
-                _placeHolderCache[i] = bitmap;
+                _placeHolderCache[i] = new PageImageItem { Image = bitmap };
             }
         }
+    }
+
+    public void CalculateDisplaySizes(double availableWidth)
+    {
+        if (_pageSizes.Count == 0) return;
+
+        _containerWidth = availableWidth;
+        double maxAspectRatio = 0;
+        foreach (var (w, h) in _pageSizes.Values)
+        {
+            double ratio = w / h;
+            if (ratio > maxAspectRatio) maxAspectRatio = ratio;
+        }
+
+        _normalizedHeight = availableWidth / maxAspectRatio;
+
+        foreach (var kvp in _pageSizes)
+        {
+            double displayWidth = _normalizedHeight * (kvp.Value.Width / kvp.Value.Height);
+            _displayWidths[kvp.Key] = displayWidth;
+        }
+
+        lock (_cacheLock)
+        {
+            foreach (var kvp in _placeHolderCache)
+            {
+                kvp.Value.ContainerWidth = _containerWidth;
+                if (_displayWidths.TryGetValue(kvp.Key, out var w))
+                {
+                    kvp.Value.Width = w;
+                    kvp.Value.Height = _normalizedHeight;
+                }
+            }
+            for (var node = _highResCache.First; node != null; node = node.Next)
+            {
+                node.Value.Value.ContainerWidth = _containerWidth;
+                if (_displayWidths.TryGetValue(node.Value.Key, out var w))
+                {
+                    node.Value.Value.Width = w;
+                    node.Value.Value.Height = _normalizedHeight;
+                }
+            }
+        }
+
+        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
     }
 
     // --- 动态 DPI ---
@@ -224,6 +297,15 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             stream.Seek(0);
             await bitmap.SetSourceAsync(stream);
         }
+
+        var item = new PageImageItem
+        {
+            Image = bitmap,
+            Width = _displayWidths.GetValueOrDefault(index, double.NaN),
+            Height = _displayWidths.Count > 0 ? _normalizedHeight : double.NaN,
+            ContainerWidth = _displayWidths.Count > 0 ? _containerWidth : double.NaN
+        };
+
         lock (_cacheLock)
         {
             // 移除同一 key 的旧节点（如果存在）
@@ -245,7 +327,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             }
 
             // 添加到队尾（最新）
-            _highResCache.AddLast(new KeyValuePair<int, BitmapImage>(index, bitmap));
+            _highResCache.AddLast(new KeyValuePair<int, PageImageItem>(index, item));
         }
         _pendingRequests.Remove(index);
 
@@ -253,7 +335,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         OnCollectionChanged(
             new NotifyCollectionChangedEventArgs(
                 NotifyCollectionChangedAction.Replace,
-                bitmap,
+                item,
                 oldValue,
                 index
             )
@@ -287,15 +369,12 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
             EnqueueRender(index);
 
-            _placeHolderCache.TryGetValue(index, out BitmapImage? placeHolderImage);
-            return placeHolderImage;
+            _placeHolderCache.TryGetValue(index, out PageImageItem? placeHolderItem);
+            return placeHolderItem;
         }
         set
         {
-            if (value is BitmapImage bitmap && _placeHolderCache[index] != bitmap)
-            {
-                _placeHolderCache[index] = bitmap;
-            }
+            // ItemsRepeater 内部使用，通过 Replace 通知更新
         }
     }
 
