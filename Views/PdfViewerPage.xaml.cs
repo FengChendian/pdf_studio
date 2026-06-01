@@ -60,18 +60,12 @@ public sealed partial class PdfViewerPage : Page
         //RenderPages();
     }
 
-    private bool _sizesCalculated = false;
-
     private void PdfScrollViewer_SizeChanged(object sender, Microsoft.UI.Xaml.SizeChangedEventArgs e)
     {
-        if (!_sizesCalculated && e.NewSize.Width > 0)
+        double availableWidth = e.NewSize.Width - 64; // ItemsRepeater margin (32 * 2)
+        if (availableWidth > 0)
         {
-            _sizesCalculated = true;
-            double availableWidth = e.NewSize.Width - 64; // ItemsRepeater margin (32 * 2)
-            if (availableWidth > 0)
-            {
-                VirtualizingImages.CalculateDisplaySizes(availableWidth);
-            }
+            VirtualizingImages.CalculateDisplaySizes(availableWidth);
         }
     }
 
@@ -121,7 +115,6 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     private const int MaxHighResCacheSize = 5;
     private volatile int _currentRenderDpi = 300;
     private readonly Dictionary<int, (double Width, double Height)> _pageSizes = [];
-    private double _normalizedHeight;
     private readonly Dictionary<int, double> _displayWidths = [];
     private double _containerWidth;
     private readonly HashSet<int> _pendingRequests = [];
@@ -169,30 +162,27 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         if (_pageSizes.Count == 0) return;
 
         _containerWidth = availableWidth;
-        double maxAspectRatio = 0;
-        foreach (var (w, h) in _pageSizes.Values)
+
+        double maxWidth = 0;
+        foreach (var (w, _) in _pageSizes.Values)
         {
-            double ratio = w / h;
-            if (ratio > maxAspectRatio) maxAspectRatio = ratio;
+            if (w > maxWidth) maxWidth = w;
         }
 
-        _normalizedHeight = availableWidth / maxAspectRatio;
-
-        foreach (var kvp in _pageSizes)
+        foreach (var pageEntry in _pageSizes)
         {
-            double displayWidth = _normalizedHeight * (kvp.Value.Width / kvp.Value.Height);
-            _displayWidths[kvp.Key] = displayWidth;
+            double scale = pageEntry.Value.Width / maxWidth;
+            _displayWidths[pageEntry.Key] = availableWidth * scale;
         }
 
         lock (_cacheLock)
         {
-            foreach (var kvp in _placeHolderCache)
+            foreach (var cacheEntry in _placeHolderCache)
             {
-                kvp.Value.ContainerWidth = _containerWidth;
-                if (_displayWidths.TryGetValue(kvp.Key, out var w))
+                cacheEntry.Value.ContainerWidth = _containerWidth;
+                if (_displayWidths.TryGetValue(cacheEntry.Key, out var w))
                 {
-                    kvp.Value.Width = w;
-                    kvp.Value.Height = _normalizedHeight;
+                    cacheEntry.Value.Width = w;
                 }
             }
             for (var node = _highResCache.First; node != null; node = node.Next)
@@ -201,7 +191,6 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                 if (_displayWidths.TryGetValue(node.Value.Key, out var w))
                 {
                     node.Value.Value.Width = w;
-                    node.Value.Value.Height = _normalizedHeight;
                 }
             }
         }
@@ -302,7 +291,6 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         {
             Image = bitmap,
             Width = _displayWidths.GetValueOrDefault(index, double.NaN),
-            Height = _displayWidths.Count > 0 ? _normalizedHeight : double.NaN,
             ContainerWidth = _displayWidths.Count > 0 ? _containerWidth : double.NaN
         };
 

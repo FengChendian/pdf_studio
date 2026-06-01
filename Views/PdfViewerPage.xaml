@@ -59,7 +59,7 @@
       VerticalScrollMode="Auto"
       HorizontalScrollBarVisibility="Auto"
       VerticalScrollBarVisibility="Auto"
-      HorizontalAlignment="Center"
+      HorizontalAlignment="Stretch"
       Height="Auto"
       ViewChanged="PdfScrollViewer_ViewChanged"
       SizeChanged="PdfScrollViewer_SizeChanged"
