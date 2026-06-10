@@ -13,6 +13,7 @@ using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
@@ -113,17 +114,16 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     private readonly LinkedList<KeyValuePair<int, PageImageItem>> _highResCache = new();
     private readonly object _cacheLock = new();
     private const int MaxHighResCacheSize = 5;
-    private volatile int _currentRenderDpi = 300;
+    private volatile int _currentRenderDpi = 400;
     private readonly Dictionary<int, (double Width, double Height)> _pageSizes = [];
     private readonly Dictionary<int, double> _displayWidths = [];
     private double _containerWidth;
-    private readonly HashSet<int> _pendingRequests = [];
     private readonly RenderingService _renderingService;
 
-    // 后台渲染线程
-    private readonly Queue<int> _renderQueue = new();
-    private readonly object _queueLock = new();
-    private readonly Thread _renderThread;
+    // 后台渲染任务：有界队列，满了自动丢弃最旧请求
+    private readonly Channel<int> _renderChannel = Channel.CreateBounded<int>(
+        new BoundedChannelOptions(7) { FullMode = BoundedChannelFullMode.DropOldest });
+    private readonly Task _renderTask;
     private readonly CancellationTokenSource _cts = new();
     private readonly DispatcherQueue _dispatcher;
     private bool _disposed;
@@ -136,12 +136,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         _dispatcher = DispatcherQueue.GetForCurrentThread()
             ?? throw new InvalidOperationException("ImagesVirtualizingCollection 必须在 UI 线程创建");
 
-        _renderThread = new Thread(RenderLoop)
-        {
-            IsBackground = true,
-            Name = $"pdf-render-{System.IO.Path.GetFileNameWithoutExtension(path)}"
-        };
-        _renderThread.Start();
+        _renderTask = Task.Run(RenderLoopAsync);
     }
 
     internal async Task InitializePlaceholdersAsync()
@@ -228,56 +223,59 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
         foreach (int index in cachedIndices)
         {
-            _pendingRequests.Remove(index);
             EnqueueRender(index);
         }
     }
 
-    // --- 后台渲染线程 ---
+    // --- 后台渲染任务 ---
 
-    private void RenderLoop()
+    private async Task RenderLoopAsync()
     {
-        while (!_cts.Token.IsCancellationRequested)
+        try
         {
-            int index;
-            lock (_queueLock)
+            while (await _renderChannel.Reader.WaitToReadAsync(_cts.Token))
             {
-                while (_renderQueue.Count == 0 && !_cts.Token.IsCancellationRequested)
-                {
-                    Monitor.Wait(_queueLock);
-                }
-                if (_cts.Token.IsCancellationRequested) break;
-                // 渲染前裁剪队列：保留最新 5 个
-                while (_renderQueue.Count > 5)
-                {
-                    var discarded = _renderQueue.Dequeue();
-                    _dispatcher.TryEnqueue(() => _pendingRequests.Remove(discarded));
-                }
-                index = _renderQueue.Dequeue();
-            }
+                if (!_renderChannel.Reader.TryRead(out var index))
+                    continue;
 
-            // CPU 密集型：后台线程以当前 DPI 同步渲染
-            int renderDpi = _currentRenderDpi;
-            var pngBytes = _renderingService.RenderPageToBytes(index, renderDpi);
-            if (pngBytes != null)
-            {
-                int capturedDpi = renderDpi;
-                _dispatcher.TryEnqueue(() => _ = FinalizeRenderAsync(index, pngBytes, capturedDpi));
+                // 渲染前检查高清缓存：已有则移到 LRU 末尾，跳过渲染
+                lock (_cacheLock)
+                {
+                    var node = _highResCache.First;
+                    while (node != null)
+                    {
+                        if (node.Value.Key == index)
+                        {
+                            var value = node.Value;
+                            _highResCache.Remove(node);
+                            _highResCache.AddLast(value);
+                            break;
+                        }
+                        node = node.Next;
+                    }
+                    if (node != null) continue; // 缓存命中，跳过渲染
+                }
+
+                // CPU 密集型：后台线程以当前 DPI 同步渲染
+                int renderDpi = _currentRenderDpi;
+                var pngBytes = _renderingService.RenderPageToBytes(index, renderDpi);
+                if (pngBytes != null)
+                {
+                    int capturedDpi = renderDpi;
+                    _dispatcher.TryEnqueue(() => _ = FinalizeRenderAsync(index, pngBytes, capturedDpi));
+                }
             }
-            else
-            {
-                _dispatcher.TryEnqueue(() => _pendingRequests.Remove(index));
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 正常取消
         }
     }
 
     private async Task FinalizeRenderAsync(int index, byte[] pngBytes, int renderDpi)
     {
         if (renderDpi != _currentRenderDpi)
-        {
-            _pendingRequests.Remove(index);
             return;
-        }
 
         var bitmap = new BitmapImage();
         using (var stream = new InMemoryRandomAccessStream())
@@ -297,27 +295,27 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         lock (_cacheLock)
         {
             // 移除同一 key 的旧节点（如果存在）
-            var node = _highResCache.First;
-            while (node != null)
-            {
-                if (node.Value.Key == index)
-                {
-                    _highResCache.Remove(node);
-                    break;
-                }
-                node = node.Next;
-            }
+            //var node = _highResCache.First;
+            //while (node != null)
+            //{
+            //    if (node.Value.Key == index)
+            //    {
+            //        _highResCache.Remove(node);
+            //        break;
+            //    }
+            //    node = node.Next;
+            //}
 
-            // 容量满时淘汰最老的
-            while (_highResCache.Count >= MaxHighResCacheSize)
-            {
-                _highResCache.RemoveFirst();
-            }
+
 
             // 添加到队尾（最新）
             _highResCache.AddLast(new KeyValuePair<int, PageImageItem>(index, item));
+            // 容量满时淘汰最老的
+            while (_highResCache.Count > MaxHighResCacheSize)
+            {
+                _highResCache.RemoveFirst();
+            }
         }
-        _pendingRequests.Remove(index);
 
         _placeHolderCache.TryGetValue(index, out var oldValue);
         OnCollectionChanged(
@@ -332,12 +330,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
     private void EnqueueRender(int index)
     {
-        lock (_queueLock)
-        {
-            _pendingRequests.Add(index);
-            _renderQueue.Enqueue(index);
-            Monitor.Pulse(_queueLock);
-        }
+        _renderChannel.Writer.TryWrite(index);
     }
 
     // --- IList 核心实现 ---
@@ -386,8 +379,8 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         _disposed = true;
 
         _cts.Cancel();
-        lock (_queueLock) { Monitor.PulseAll(_queueLock); }
-        _renderThread.Join(TimeSpan.FromSeconds(5));
+        _renderChannel.Writer.Complete();
+        _renderTask.Wait(TimeSpan.FromSeconds(5));
         _cts.Dispose();
         _renderingService.Dispose();
     }
