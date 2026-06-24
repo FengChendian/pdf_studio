@@ -118,6 +118,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     private readonly Dictionary<int, (double Width, double Height)> _pageSizes = [];
     private readonly Dictionary<int, double> _displayWidths = [];
     private double _containerWidth;
+    private readonly string _filePath;
     private readonly RenderingService _renderingService;
 
     // 后台渲染任务：有界队列，满了自动丢弃最旧请求
@@ -132,6 +133,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
     public ImagesVirtualizingCollection(string path)
     {
+        _filePath = path;
         _renderingService = new RenderingService(path);
         _dispatcher = DispatcherQueue.GetForCurrentThread()
             ?? throw new InvalidOperationException("ImagesVirtualizingCollection 必须在 UI 线程创建");
@@ -141,14 +143,78 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
     internal async Task InitializePlaceholdersAsync()
     {
-        for (int i = 0; i < _renderingService.PageCount; i++)
+        int pageCount = _renderingService.PageCount;
+
+        // Step 1: Get page sizes from local RenderingService (fast, no rendering)
+        for (int i = 0; i < pageCount; i++)
         {
             _pageSizes[i] = _renderingService.GetPageSize(i);
-            var bitmap = await _renderingService.RenderPageToBitmap(i, 72);
-            if (bitmap != null)
+        }
+
+        // Step 2: Try multi-process rendering first
+        bool multiProcessSucceeded = false;
+
+        try
+        {
+            using var server = new MultiProcessRenderServer(_filePath, workerCount: 8);
+            var result = await server.RenderAllPagesAsync(dpi: 72);
+
+            if (result.IsComplete)
             {
-                _placeHolderCache[i] = new PageImageItem { Image = bitmap };
+                for (int i = 0; i < pageCount; i++)
+                {
+                    var page = result.Pages[i];
+                    var bitmap = await ConvertPngToBitmapAsync(page.PngBytes);
+                    if (bitmap != null)
+                    {
+                        _placeHolderCache[i] = new PageImageItem { Image = bitmap };
+                    }
+                }
+                multiProcessSucceeded = true;
+                Debug.WriteLine($"[MultiProcess] Successfully rendered {pageCount} placeholder pages");
             }
+        }
+        catch (WorkerNotFoundException)
+        {
+            Debug.WriteLine("[MultiProcess] Worker executable not found, falling back to sequential rendering");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[MultiProcess] Failed, falling back to sequential: {ex.Message}");
+        }
+
+        // Step 3: Fallback to sequential rendering if multi-process didn't succeed
+        if (!multiProcessSucceeded)
+        {
+            for (int i = 0; i < pageCount; i++)
+            {
+                var bitmap = await _renderingService.RenderPageToBitmap(i, 72);
+                if (bitmap != null)
+                {
+                    _placeHolderCache[i] = new PageImageItem { Image = bitmap };
+                }
+            }
+        }
+    }
+
+    /// <summary>Converts PNG byte array to BitmapImage on the UI thread.</summary>
+    private static async Task<BitmapImage?> ConvertPngToBitmapAsync(byte[] pngBytes)
+    {
+        try
+        {
+            var bitmap = new BitmapImage();
+            using (var stream = new InMemoryRandomAccessStream())
+            {
+                await stream.WriteAsync(pngBytes.AsBuffer());
+                stream.Seek(0);
+                await bitmap.SetSourceAsync(stream);
+            }
+            return bitmap;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[MultiProcess] Failed to create BitmapImage: {ex.Message}");
+            return null;
         }
     }
 
