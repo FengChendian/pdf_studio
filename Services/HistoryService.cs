@@ -4,7 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
-using Windows.Storage;
 
 namespace pdf_studio.Services;
 
@@ -17,9 +16,16 @@ public class RecentFile
 
 public class HistoryService
 {
+    private const string AppFolderName = "PDFStudio";
     private const string HistoryFileName = "history.json";
     private const int MaxHistoryCount = 20;
     private List<RecentFile> _recentFiles = new();
+
+    private static string DataFolderPath =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppFolderName);
+
+    private static string HistoryFilePath =>
+        Path.Combine(DataFolderPath, HistoryFileName);
 
     public HistoryService()
     {
@@ -29,11 +35,10 @@ public class HistoryService
     {
         try
         {
-            var localFolder = ApplicationData.Current.LocalFolder;
-            var file = await localFolder.TryGetItemAsync(HistoryFileName);
-            if (file != null)
+            if (File.Exists(HistoryFilePath))
             {
-                var json = await File.ReadAllTextAsync(file.Path);
+                var json = await File.ReadAllTextAsync(HistoryFilePath);
+                //Debug.WriteLine(json);
                 _recentFiles = JsonSerializer.Deserialize<List<RecentFile>>(json) ?? new List<RecentFile>();
             }
         }
@@ -47,10 +52,9 @@ public class HistoryService
     {
         try
         {
-            var localFolder = ApplicationData.Current.LocalFolder;
-            var filePath = Path.Combine(localFolder.Path, HistoryFileName);
+            Directory.CreateDirectory(DataFolderPath);
             var json = JsonSerializer.Serialize(_recentFiles);
-            await File.WriteAllTextAsync(filePath, json);
+            await File.WriteAllTextAsync(HistoryFilePath, json);
         }
         catch
         {

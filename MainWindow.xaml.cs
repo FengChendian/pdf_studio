@@ -20,6 +20,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        AppWindow.SetIcon("Assets/light_icon.ico");
         InitializeAsync();
     }
 
