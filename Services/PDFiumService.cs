@@ -1,21 +1,40 @@
+using Microsoft.UI.Xaml.Media.Imaging;
+using mupdf;
 using PDFiumCore;
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
-using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.UI.Xaml.Media.Imaging;
 
 namespace pdf_studio.Services
 {
     internal class PDFiumService : IDisposable
     {
         /// <summary>
-        /// Document pool: filePath → array of independent document instances.
-        /// Each array slot acts as a "thread slot" — PDFium requires a separate
-        /// document handle per concurrent thread.
+        /// Holds a document handle together with the native memory buffer that
+        /// backs it. PDFium reads directly from this buffer, so it must remain
+        /// alive and unpinned for the document's entire lifetime.
         /// </summary>
-        private readonly Dictionary<string, FpdfDocumentT[]> _documentPool = new();
+        private sealed class DocumentSlot
+        {
+            public FpdfDocumentT Document;
+            public IntPtr Buffer;
+
+            public void Dispose()
+            {
+                fpdfview.FPDF_CloseDocument(Document);
+                Marshal.FreeHGlobal(Buffer);
+            }
+        }
+
+        /// <summary>
+        /// Document pool: filePath → array of independent document instances.
+        /// Each slot is backed by its own copy of the file bytes, allocated in
+        /// native memory so PDFium can read from it without filesystem contention.
+        /// </summary>
+        private readonly Dictionary<string, DocumentSlot[]> _documentPool = new();
         private readonly object _poolLock = new();
         private bool _disposed;
 
@@ -25,24 +44,30 @@ namespace pdf_studio.Services
         }
 
         // ════════════════════════════════════════════════════════════════
-        //  Single-page render (opens a temporary document)
+        //  Document metadata (lightweight — opens/closes a temp document)
         // ════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Renders a single page of a PDF directly into a <see cref="WriteableBitmap"/>.
-        /// Opens and closes the document within the call — suitable for one-off renders.
-        /// For batch rendering use <see cref="RenderPagesToWriteableBitmaps"/>.
-        /// </summary>
-        /// <param name="pageNumber">Zero-based page index (0 = first page).</param>
-        public WriteableBitmap RenderPageToWriteableBitmap(
-            string filePath,
-            int pageNumber = 0,
-            float scale = 1f)
+        public int GetPageCount(string filePath)
         {
             var document = fpdfview.FPDF_LoadDocument(filePath, null);
             try
             {
-                return RenderSinglePage(document, pageNumber, scale);
+                return fpdfview.FPDF_GetPageCount(document);
+            }
+            finally
+            {
+                fpdfview.FPDF_CloseDocument(document);
+            }
+        }
+
+        public (double Width, double Height) GetPageSize(string filePath, int pageNumber)
+        {
+            double width = 0, height = 0;
+            var document = fpdfview.FPDF_LoadDocument(filePath, null);
+            try
+            {
+                fpdfview.FPDF_GetPageSizeByIndex(document, pageNumber, ref width, ref height);
+                return (width, height);
             }
             finally
             {
@@ -51,47 +76,79 @@ namespace pdf_studio.Services
         }
 
         // ════════════════════════════════════════════════════════════════
-        //  Batch parallel render — returns Dictionary
+        //  Thread-safe raw rendering (NO UI dependency — safe on any thread)
         // ════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Renders multiple pages in parallel using a pool of independent document
-        /// instances. Results are returned as a dictionary keyed by page number.
+        /// Renders a single page into a raw byte buffer.
+        /// Thread-safe — may be called from any thread.
         /// </summary>
-        /// <param name="filePath">Path to the PDF file.</param>
-        /// <param name="pageNumbers">Zero-based page indices to render.</param>
-        /// <param name="scale">Render scale factor (1.0 = 72 DPI).</param>
-        /// <returns>Dictionary mapping each requested page number to its rendered bitmap.</returns>
+        public (int width, int height, byte[] pixels) RenderPageToRawBuffer(
+            string filePath,
+            int pageNumber = 0,
+            float scale = 1f)
+        {
+            var document = fpdfview.FPDF_LoadDocument(filePath, null);
+            try
+            {
+                return RenderSinglePageToBuffer(document, pageNumber, scale);
+            }
+            finally
+            {
+                fpdfview.FPDF_CloseDocument(document);
+            }
+        }
+
+        /// <summary>
+        /// Renders multiple pages in parallel into raw byte buffers.
+        /// Thread-safe — may be called from any thread.
+        /// </summary>
+        public (int width, int height, byte[] pixels)[] RenderPagesToRawBuffers(
+            string filePath,
+            int[] pageNumbers,
+            float scale = 1f)
+        {
+            var rawBuffers = new (int width, int height, byte[] pixels)[pageNumbers.Length];
+            RenderPagesToRawBuffersInternal(filePath, pageNumbers, rawBuffers, scale);
+            return rawBuffers;
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        //  Single-page convenience (UI-thread only — creates WriteableBitmap)
+        // ════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Renders a single page directly into a <see cref="WriteableBitmap"/>.
+        /// Must be called from the UI Thread.
+        /// </summary>
+        public WriteableBitmap RenderPageToWriteableBitmap(
+            string filePath,
+            int pageNumber = 0,
+            float scale = 1f)
+        {
+            var (width, height, pixels) = RenderPageToRawBuffer(filePath, pageNumber, scale);
+            return CreateWriteableBitmapFromRawBuffer(width, height, pixels);
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        //  Batch parallel convenience (UI-thread only — creates WriteableBitmaps)
+        // ════════════════════════════════════════════════════════════════
+
         public Dictionary<int, WriteableBitmap> RenderPagesToWriteableBitmaps(
             string filePath,
             int[] pageNumbers,
             float scale = 1f)
         {
-            var output = new WriteableBitmap[pageNumbers.Length];
-            RenderPagesInternal(filePath, pageNumbers, output, scale);
-
+            var rawBuffers = RenderPagesToRawBuffers(filePath, pageNumbers, scale);
             var result = new Dictionary<int, WriteableBitmap>(pageNumbers.Length);
             for (int i = 0; i < pageNumbers.Length; i++)
-                result[pageNumbers[i]] = output[i];
+            {
+                var (w, h, p) = rawBuffers[i];
+                result[pageNumbers[i]] = CreateWriteableBitmapFromRawBuffer(w, h, p);
+            }
             return result;
         }
 
-        // ════════════════════════════════════════════════════════════════
-        //  Batch parallel render — fills a pre-allocated array
-        // ════════════════════════════════════════════════════════════════
-
-        /// <summary>
-        /// Renders multiple pages in parallel, writing results directly into a
-        /// pre-allocated <see cref="WriteableBitmap"/> array in the same order
-        /// as <paramref name="pageNumbers"/>.
-        /// </summary>
-        /// <param name="filePath">Path to the PDF file.</param>
-        /// <param name="pageNumbers">Zero-based page indices to render.</param>
-        /// <param name="outputBitmaps">
-        /// Pre-allocated array to receive the rendered bitmaps.
-        /// Must be at least as long as <paramref name="pageNumbers"/>.
-        /// </param>
-        /// <param name="scale">Render scale factor (1.0 = 72 DPI).</param>
         public void RenderPagesToWriteableBitmaps(
             string filePath,
             int[] pageNumbers,
@@ -103,47 +160,80 @@ namespace pdf_studio.Services
                     $"Output array size ({outputBitmaps.Length}) is smaller than page count ({pageNumbers.Length}).",
                     nameof(outputBitmaps));
 
-            RenderPagesInternal(filePath, pageNumbers, outputBitmaps, scale);
+            var rawBuffers = RenderPagesToRawBuffers(filePath, pageNumbers, scale);
+            for (int i = 0; i < pageNumbers.Length; i++)
+            {
+                var (w, h, p) = rawBuffers[i];
+                outputBitmaps[i] = CreateWriteableBitmapFromRawBuffer(w, h, p);
+            }
         }
 
         // ════════════════════════════════════════════════════════════════
-        //  Core parallel rendering
+        //  Core parallel rendering (thread-safe — raw bytes only, no UI types)
         // ════════════════════════════════════════════════════════════════
 
-        private void RenderPagesInternal(
+        private void RenderPagesToRawBuffersInternal(
             string filePath,
             int[] pageNumbers,
-            WriteableBitmap[] output,
+            (int width, int height, byte[] pixels)[] output,
             float scale)
         {
             if (pageNumbers.Length == 0) return;
 
-            // Determine parallelism: one document instance per concurrent thread.
-            int threadCount = Math.Min(pageNumbers.Length, Environment.ProcessorCount);
+            int threadCount = Math.Min(pageNumbers.Length, 2);
             threadCount = Math.Max(threadCount, 1);
 
             var documents = GetOrCreateDocumentPool(filePath, threadCount);
 
-            // Thread-local doc slot assignment via Interlocked — each worker thread
-            // gets its own document instance so PDFium calls stay thread-safe.
-            int slotCounter = -1;
+            // Manually distribute pages across N tasks, each with its own
+            // dedicated document instance. No contention: every page index is
+            // written by exactly one worker, every worker owns exactly one
+            // document handle.
+            int pagesPerThread = pageNumbers.Length / threadCount;
+            int remainder = pageNumbers.Length % threadCount;
 
-            Parallel.For(0, pageNumbers.Length,
-                new ParallelOptions { MaxDegreeOfParallelism = threadCount },
-                () => Interlocked.Increment(ref slotCounter) % documents.Length,
-                (i, loopState, docIndex) =>
+            var tasks = new Task[threadCount];
+            int offset = 0;
+            for (int t = 0; t < threadCount; t++)
+            {
+                int threadIndex = t;
+                int start = offset;
+                int count = pagesPerThread + (t < remainder ? 1 : 0);
+                offset += count;
+
+                int localStart = start;
+                int localCount = count;
+
+                tasks[t] = Task.Run(() =>
                 {
-                    output[i] = RenderSinglePage(documents[docIndex], pageNumbers[i], scale);
-                    return docIndex;
-                },
-                _ => { });
+                    var doc = documents[threadIndex].Document;
+                    for (int j = 0; j < localCount; j++)
+                    {
+                        int pageIdx = localStart + j; // 使用快照
+                        output[pageIdx] = RenderSinglePageToBuffer(
+                            doc, pageNumbers[pageIdx], scale);
+                    }
+                });
+            }
+
+            Task.WaitAll(tasks);
         }
 
         // ════════════════════════════════════════════════════════════════
-        //  Per-page render core (document must be already open)
+        //  Per-page raw rendering (Thread-agnostic)
         // ════════════════════════════════════════════════════════════════
 
-        private static WriteableBitmap RenderSinglePage(
+        /// <summary>
+        /// Renders a single page into a raw byte array instead of a UI element.
+        /// This is safe to run on background ThreadPool threads.
+        /// </summary>
+        /// <remarks>
+        /// PDFium is not internally thread-safe — even on different document handles,
+        /// concurrent calls to FPDF_LoadPage/FPDF_ClosePage can race on global state.
+        /// </remarks>
+        private static readonly object _pageLock = new();
+
+        internal static (int width, int height, byte[] pixels) RenderSinglePageToBuffer(
             FpdfDocumentT document,
             int pageNumber,
             float scale)
@@ -151,13 +241,20 @@ namespace pdf_studio.Services
             double pageWidth = 0;
             double pageHeight = 0;
 
-            var page = fpdfview.FPDF_LoadPage(document, pageNumber);
+            FpdfPageT page;
+            lock (_pageLock)
+            {
+                page = fpdfview.FPDF_LoadPage(document, pageNumber);
+            }
             try
             {
-                fpdfview.FPDF_GetPageSizeByIndex(document, pageNumber, ref pageWidth, ref pageHeight);
+                lock (_pageLock)
+                {
+                    fpdfview.FPDF_GetPageSizeByIndex(document, pageNumber, ref pageWidth, ref pageHeight);
+                }
 
-                int width = (int)pageWidth;
-                int height = (int)pageHeight;
+                int width = (int)(pageWidth * scale);
+                int height = (int)(pageHeight * scale);
 
                 var bitmap = fpdfview.FPDFBitmapCreateEx(
                     width, height,
@@ -174,6 +271,7 @@ namespace pdf_studio.Services
                     fpdfview.FPDFBitmapFillRect(bitmap, 0, 0, width, height, color);
 
                     using var matrix = new FS_MATRIX_();
+                    using var clip = new FS_RECTF_();
                     matrix.A = scale;
                     matrix.B = 0;
                     matrix.C = 0;
@@ -181,38 +279,46 @@ namespace pdf_studio.Services
                     matrix.E = 0;
                     matrix.F = 0;
 
-                    fpdfview.FPDF_RenderPageBitmapWithMatrix(
-                        bitmap, page, matrix, null,
-                        (int)RenderFlags.RenderAnnotations);
+                    clip.Left = 0;
+                    clip.Top = 0;
+                    clip.Right = width;
+                    clip.Bottom = height;
+
+                    lock (_pageLock)
+                    {
+                        fpdfview.FPDF_RenderPageBitmapWithMatrix(
+                            bitmap, page, matrix, clip,
+                            (int)RenderFlags.RenderAnnotations);
+                    }
 
                     var scan0 = fpdfview.FPDFBitmapGetBuffer(bitmap);
                     var stride = fpdfview.FPDFBitmapGetStride(bitmap);
                     int rowBytes = width * 4; // BGRA = 4 bytes per pixel
 
-                    var writeableBitmap = new WriteableBitmap(width, height);
+                    // Extract memory locally inside the thread
+                    byte[] pixelData = new byte[height * rowBytes];
 
                     unsafe
                     {
                         byte* src = (byte*)scan0;
-                        using var pixelStream = writeableBitmap.PixelBuffer.AsStream();
 
                         if (stride == rowBytes)
                         {
                             // Rows are tightly packed — copy everything in one pass.
-                            pixelStream.Write(new ReadOnlySpan<byte>(src, height * rowBytes));
+                            new ReadOnlySpan<byte>(src, height * rowBytes).CopyTo(pixelData);
                         }
                         else
                         {
                             // Stride includes padding — copy row by row.
                             for (int y = 0; y < height; y++)
                             {
-                                pixelStream.Write(new ReadOnlySpan<byte>(src + y * stride, rowBytes));
+                                new ReadOnlySpan<byte>(src + y * stride, rowBytes)
+                                    .CopyTo(new Span<byte>(pixelData, y * rowBytes, rowBytes));
                             }
                         }
                     }
 
-                    writeableBitmap.Invalidate();
-                    return writeableBitmap;
+                    return (width, height, pixelData);
                 }
                 finally
                 {
@@ -221,8 +327,28 @@ namespace pdf_studio.Services
             }
             finally
             {
-                fpdfview.FPDF_ClosePage(page);
+                lock (_pageLock)
+                {
+                    fpdfview.FPDF_ClosePage(page);
+                }
             }
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        //  UI Helper (must be called on the UI thread)
+        // ════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Creates a <see cref="WriteableBitmap"/> from raw BGRA pixel data.
+        /// Must be called from the UI thread.
+        /// </summary>
+        public static WriteableBitmap CreateWriteableBitmapFromRawBuffer(int width, int height, byte[] pixelData)
+        {
+            var writeableBitmap = new WriteableBitmap(width, height);
+            using var pixelStream = writeableBitmap.PixelBuffer.AsStream();
+            pixelStream.Write(pixelData, 0, pixelData.Length);
+            writeableBitmap.Invalidate();
+            return writeableBitmap;
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -230,10 +356,11 @@ namespace pdf_studio.Services
         // ════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Ensures at least <paramref name="count"/> independent document instances
-        /// are available for <paramref name="filePath"/>. Grows the pool if needed.
+        /// Gets or creates a pool of independent document instances, each backed
+        /// by its own copy of the file in native memory. This eliminates
+        /// filesystem-level contention when multiple threads render concurrently.
         /// </summary>
-        private FpdfDocumentT[] GetOrCreateDocumentPool(string filePath, int count)
+        private DocumentSlot[] GetOrCreateDocumentPool(string filePath, int count)
         {
             lock (_poolLock)
             {
@@ -242,19 +369,19 @@ namespace pdf_studio.Services
                     if (existing.Length >= count)
                         return existing;
 
-                    // Grow the pool.
-                    var expanded = new FpdfDocumentT[count];
+                    // Grow the pool — only create the additional slots.
+                    var expanded = new DocumentSlot[count];
                     Array.Copy(existing, expanded, existing.Length);
                     for (int i = existing.Length; i < count; i++)
-                        expanded[i] = fpdfview.FPDF_LoadDocument(filePath, null);
+                        expanded[i] = CreateDocumentSlot(filePath);
                     _documentPool[filePath] = expanded;
                     return expanded;
                 }
                 else
                 {
-                    var pool = new FpdfDocumentT[count];
+                    var pool = new DocumentSlot[count];
                     for (int i = 0; i < count; i++)
-                        pool[i] = fpdfview.FPDF_LoadDocument(filePath, null);
+                        pool[i] = CreateDocumentSlot(filePath);
                     _documentPool[filePath] = pool;
                     return pool;
                 }
@@ -262,32 +389,42 @@ namespace pdf_studio.Services
         }
 
         /// <summary>
-        /// Closes all cached document instances for the given file.
-        /// Subsequent renders will re-open documents as needed.
+        /// Reads the file once, copies the bytes into native memory, then opens
+        /// a PDFium document from that memory. The native buffer stays alive
+        /// until <see cref="DocumentSlot.Dispose"/> is called.
         /// </summary>
+        private static DocumentSlot CreateDocumentSlot(string filePath)
+        {
+            byte[] fileBytes = File.ReadAllBytes(filePath);
+            int size = fileBytes.Length;
+
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            Marshal.Copy(fileBytes, 0, buffer, size);
+
+            var document = fpdfview.FPDF_LoadMemDocument(buffer, size, null);
+            return new DocumentSlot { Document = document, Buffer = buffer };
+        }
+
         public void EvictDocument(string filePath)
         {
             lock (_poolLock)
             {
-                if (_documentPool.Remove(filePath, out var documents))
+                if (_documentPool.Remove(filePath, out var slots))
                 {
-                    foreach (var doc in documents)
-                        fpdfview.FPDF_CloseDocument(doc);
+                    foreach (var slot in slots)
+                        slot.Dispose();
                 }
             }
         }
 
-        /// <summary>
-        /// Closes all cached document instances across all files.
-        /// </summary>
         public void EvictAllDocuments()
         {
             lock (_poolLock)
             {
-                foreach (var (_, documents) in _documentPool)
+                foreach (var (_, slots) in _documentPool)
                 {
-                    foreach (var doc in documents)
-                        fpdfview.FPDF_CloseDocument(doc);
+                    foreach (var slot in slots)
+                        slot.Dispose();
                 }
                 _documentPool.Clear();
             }

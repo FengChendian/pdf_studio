@@ -1,33 +1,29 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Runtime.InteropServices.WindowsRuntime;
+using System.Collections.Specialized;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using Microsoft.UI.Dispatching;
+using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media.Imaging;
 using pdf_studio.Services;
 
 namespace pdf_studio.Views;
 
-using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.Collections.Specialized;
-using System.Diagnostics;
-using System.Threading;
-using System.Threading.Channels;
-using System.Threading.Tasks;
-using Microsoft.UI.Dispatching;
-using Microsoft.UI.Xaml;
-using Windows.Storage.Streams;
-
 public sealed partial class PdfViewerPage : Page
 {
     public readonly string FileName;
-    //private readonly RenderingService _renderingService;
 
-    public ObservableCollection<BitmapImage> Images { get; private set; } = [];
+    public ObservableCollection<WriteableBitmap> Images { get; private set; } = [];
     public readonly ImagesVirtualizingCollection VirtualizingImages;
 
-    // Zoom-DPI 阈值
+    // Zoom-DPI thresholds
     private const double ZoomThreshold = 2.0;
     private const int DefaultRenderDpi = 500;
     private const int HighRenderDpi = 600;
@@ -36,32 +32,28 @@ public sealed partial class PdfViewerPage : Page
 
     public int RenderedPageCount
     {
-        get => Images.Count;
+        get => VirtualizingImages.Count;
     }
 
     public PdfViewerPage(string filename)
     {
         FileName = filename;
-        //_renderingService = new RenderingService(FileName);
         VirtualizingImages = new ImagesVirtualizingCollection(FileName);
         InitializeComponent();
-        //InitRepeater();
         _ = LoadAsync();
     }
 
     private async Task LoadAsync()
     {
-        // 第一步：渲染所有 72dpi 占位图
+        // Render all placeholder images (parallel, scale=1)
         await VirtualizingImages.InitializePlaceholdersAsync();
 
-        // 占位图就绪，切换可见性
+        // Switch visibility
         LoadingOverlay.Visibility = Microsoft.UI.Xaml.Visibility.Collapsed;
         PdfScrollViewer.Visibility = Microsoft.UI.Xaml.Visibility.Visible;
-
-        //RenderPages();
     }
 
-    private void PdfScrollViewer_SizeChanged(object sender, Microsoft.UI.Xaml.SizeChangedEventArgs e)
+    private void PdfScrollViewer_SizeChanged(object sender, SizeChangedEventArgs e)
     {
         double availableWidth = e.NewSize.Width - 64; // ItemsRepeater margin (32 * 2)
         if (availableWidth > 0)
@@ -72,7 +64,6 @@ public sealed partial class PdfViewerPage : Page
 
     private void PdfScrollViewer_ViewChanged(ScrollView sender, object args)
     {
-        //Debug.WriteLine($"ViewChanged, vertical offset {sender.VerticalOffset}");
         if (_zoomDebounceTimer == null)
         {
             _zoomDebounceTimer = new DispatcherTimer
@@ -100,13 +91,25 @@ public sealed partial class PdfViewerPage : Page
     }
 }
 
+// ════════════════════════════════════════════════════════════════
+//  Data item for ItemsRepeater
+// ════════════════════════════════════════════════════════════════
+
 public class PageImageItem
 {
-    public BitmapImage? Image { get; set; }
+    /// <summary>
+    /// Rendered page bitmap. <see cref="WriteableBitmap"/> is used directly
+    /// as <see cref="Image.Source"/> — no PNG round-trip needed.
+    /// </summary>
+    public WriteableBitmap? Image { get; set; }
     public double Width { get; set; } = double.NaN;
     public double Height { get; set; } = double.NaN;
     public double ContainerWidth { get; set; } = double.NaN;
 }
+
+// ════════════════════════════════════════════════════════════════
+//  Virtualizing collection backed by PDFiumService
+// ════════════════════════════════════════════════════════════════
 
 public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChanged, IDisposable
 {
@@ -119,9 +122,10 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     private readonly Dictionary<int, double> _displayWidths = [];
     private double _containerWidth;
     private readonly string _filePath;
-    private readonly RenderingService _renderingService;
+    private readonly PDFiumService _pdfiumService;
+    private int _pageCount;
 
-    // 后台渲染任务：有界队列，满了自动丢弃最旧请求
+    // Background render channel: bounded queue, drops oldest when full.
     private readonly Channel<int> _renderChannel = Channel.CreateBounded<int>(
         new BoundedChannelOptions(7) { FullMode = BoundedChannelFullMode.DropOldest });
     private readonly Task _renderTask;
@@ -134,89 +138,41 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     public ImagesVirtualizingCollection(string path)
     {
         _filePath = path;
-        _renderingService = new RenderingService(path);
+        _pdfiumService = new PDFiumService();
+        _pageCount = _pdfiumService.GetPageCount(_filePath);
         _dispatcher = DispatcherQueue.GetForCurrentThread()
             ?? throw new InvalidOperationException("ImagesVirtualizingCollection 必须在 UI 线程创建");
 
         _renderTask = Task.Run(RenderLoopAsync);
     }
 
+    // ════════════════════════════════════════════════════════════
+    //  Placeholder initialization (batch parallel render)
+    // ════════════════════════════════════════════════════════════
+
     internal async Task InitializePlaceholdersAsync()
     {
-        int pageCount = _renderingService.PageCount;
+        int[] allPages = Enumerable.Range(0, _pageCount).ToArray();
 
-        // Step 1: Get page sizes from local RenderingService (fast, no rendering)
-        for (int i = 0; i < pageCount; i++)
+        // Phase 1 — background thread: parallel PDFium render to raw bytes.
+        var rawBuffers = await Task.Run(() =>
+            _pdfiumService.RenderPagesToRawBuffers(_filePath, allPages, scale: 1f));
+
+        // Phase 2 — UI thread: create WriteableBitmap from raw bytes.
+        for (int i = 0; i < _pageCount; i++)
         {
-            _pageSizes[i] = _renderingService.GetPageSize(i);
+            var (w, h, pixels) = rawBuffers[i];
+            var bitmap = PDFiumService.CreateWriteableBitmapFromRawBuffer(w, h, pixels);
+            _pageSizes[i] = (w, h);
+            _placeHolderCache[i] = new PageImageItem { Image = bitmap };
         }
 
-        // Step 2: Try multi-process rendering first
-        bool multiProcessSucceeded = false;
-
-        try
-        {
-            using var server = new MultiProcessRenderServer(_filePath, workerCount: 8);
-            var result = await server.RenderAllPagesAsync(dpi: 72);
-
-            if (result.IsComplete)
-            {
-                for (int i = 0; i < pageCount; i++)
-                {
-                    var page = result.Pages[i];
-                    var bitmap = await ConvertPngToBitmapAsync(page.PngBytes);
-                    if (bitmap != null)
-                    {
-                        _placeHolderCache[i] = new PageImageItem { Image = bitmap };
-                    }
-                }
-                multiProcessSucceeded = true;
-                Debug.WriteLine($"[MultiProcess] Successfully rendered {pageCount} placeholder pages");
-            }
-        }
-        catch (WorkerNotFoundException)
-        {
-            Debug.WriteLine("[MultiProcess] Worker executable not found, falling back to sequential rendering");
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"[MultiProcess] Failed, falling back to sequential: {ex.Message}");
-        }
-
-        // Step 3: Fallback to sequential rendering if multi-process didn't succeed
-        if (!multiProcessSucceeded)
-        {
-            for (int i = 0; i < pageCount; i++)
-            {
-                var bitmap = await _renderingService.RenderPageToBitmap(i, 72);
-                if (bitmap != null)
-                {
-                    _placeHolderCache[i] = new PageImageItem { Image = bitmap };
-                }
-            }
-        }
+        Debug.WriteLine($"[PDFium] Batch-rendered {_pageCount} placeholder pages in parallel");
     }
 
-    /// <summary>Converts PNG byte array to BitmapImage on the UI thread.</summary>
-    private static async Task<BitmapImage?> ConvertPngToBitmapAsync(byte[] pngBytes)
-    {
-        try
-        {
-            var bitmap = new BitmapImage();
-            using (var stream = new InMemoryRandomAccessStream())
-            {
-                await stream.WriteAsync(pngBytes.AsBuffer());
-                stream.Seek(0);
-                await bitmap.SetSourceAsync(stream);
-            }
-            return bitmap;
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"[MultiProcess] Failed to create BitmapImage: {ex.Message}");
-            return null;
-        }
-    }
+    // ════════════════════════════════════════════════════════════
+    //  Layout: calculate display widths from page aspect ratios
+    // ════════════════════════════════════════════════════════════
 
     public void CalculateDisplaySizes(double availableWidth)
     {
@@ -259,20 +215,13 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
     }
 
-    // --- 动态 DPI ---
+    // ════════════════════════════════════════════════════════════
+    //  Dynamic DPI switching
+    // ════════════════════════════════════════════════════════════
 
     public void SetRenderDpi(int newDpi)
     {
-        //if (newDpi == _currentRenderDpi)
-        //    return;
-        //Debug.WriteLine(newDpi);
-        //int oldDpi = _currentRenderDpi;
-        //_currentRenderDpi = newDpi;
-
-        //if (newDpi > oldDpi)
-        //{
-        //    ReRenderCachedPages();
-        //}
+        // Reserved for future use: re-render cached pages at new DPI.
     }
 
     private void ReRenderCachedPages()
@@ -293,7 +242,9 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         }
     }
 
-    // --- 后台渲染任务 ---
+    // ════════════════════════════════════════════════════════════
+    //  Background render loop
+    // ════════════════════════════════════════════════════════════
 
     private async Task RenderLoopAsync()
     {
@@ -304,7 +255,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                 if (!_renderChannel.Reader.TryRead(out var index))
                     continue;
 
-                // 渲染前检查高清缓存：已有则移到 LRU 末尾，跳过渲染
+                // Check high-res cache — if already present, move to LRU tail & skip.
                 lock (_cacheLock)
                 {
                     var node = _highResCache.First;
@@ -319,37 +270,40 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                         }
                         node = node.Next;
                     }
-                    if (node != null) continue; // 缓存命中，跳过渲染
+                    if (node != null) continue;
                 }
 
-                // CPU 密集型：后台线程以当前 DPI 同步渲染
+                // Phase 1 — background thread: PDFium render to raw bytes.
+                // scale = dpi / 72 (e.g. 400/72 ≈ 5.56, 600/72 ≈ 8.33).
                 int renderDpi = _currentRenderDpi;
-                var pngBytes = _renderingService.RenderPageToBytes(index, renderDpi);
-                if (pngBytes != null)
-                {
-                    int capturedDpi = renderDpi;
-                    _dispatcher.TryEnqueue(() => _ = FinalizeRenderAsync(index, pngBytes, capturedDpi));
-                }
+                float scale = renderDpi / 72f;
+                var (width, height, pixels) = _pdfiumService.RenderPageToRawBuffer(
+                    _filePath, index, scale);
+
+                // Phase 2 — UI thread: create WriteableBitmap & finalize.
+                int capturedDpi = renderDpi;
+                
+                _dispatcher.TryEnqueue(() => FinalizeRender(index, width, height, pixels, capturedDpi));
             }
         }
         catch (OperationCanceledException)
         {
-            // 正常取消
+            // Normal shutdown.
         }
     }
 
-    private async Task FinalizeRenderAsync(int index, byte[] pngBytes, int renderDpi)
+    /// <summary>
+    /// Called on the UI thread: creates a <see cref="WriteableBitmap"/> from the raw
+    /// buffer, manages the high-res cache, and fires <see cref="CollectionChanged"/>
+    /// so the ItemsRepeater picks up the new bitmap.
+    /// </summary>
+    private void FinalizeRender(int index, int width, int height, byte[] pixels, int renderDpi)
     {
         if (renderDpi != _currentRenderDpi)
             return;
 
-        var bitmap = new BitmapImage();
-        using (var stream = new InMemoryRandomAccessStream())
-        {
-            await stream.WriteAsync(pngBytes.AsBuffer());
-            stream.Seek(0);
-            await bitmap.SetSourceAsync(stream);
-        }
+        // WriteableBitmap must be created on the UI thread — and we are on it.
+        var bitmap = PDFiumService.CreateWriteableBitmapFromRawBuffer(width, height, pixels);
 
         var item = new PageImageItem
         {
@@ -360,23 +314,9 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
         lock (_cacheLock)
         {
-            // 移除同一 key 的旧节点（如果存在）
-            //var node = _highResCache.First;
-            //while (node != null)
-            //{
-            //    if (node.Value.Key == index)
-            //    {
-            //        _highResCache.Remove(node);
-            //        break;
-            //    }
-            //    node = node.Next;
-            //}
-
-
-
-            // 添加到队尾（最新）
+            // Add to tail (most recent).
             _highResCache.AddLast(new KeyValuePair<int, PageImageItem>(index, item));
-            // 容量满时淘汰最老的
+            // Evict oldest when over capacity.
             while (_highResCache.Count > MaxHighResCacheSize)
             {
                 _highResCache.RemoveFirst();
@@ -399,7 +339,9 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         _renderChannel.Writer.TryWrite(index);
     }
 
-    // --- IList 核心实现 ---
+    // ════════════════════════════════════════════════════════════
+    //  IList — ItemsRepeater virtualizing access
+    // ════════════════════════════════════════════════════════════
 
     public object? this[int index]
     {
@@ -426,18 +368,20 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         }
         set
         {
-            // ItemsRepeater 内部使用，通过 Replace 通知更新
+            // Set by ItemsRepeater internally; handled via Replace notification.
         }
     }
 
-    public int Count => _renderingService.PageCount;
+    public int Count => _pageCount;
 
     protected virtual void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
     {
         CollectionChanged?.Invoke(this, e);
     }
 
-    // --- IDisposable ---
+    // ════════════════════════════════════════════════════════════
+    //  IDisposable
+    // ════════════════════════════════════════════════════════════
 
     public void Dispose()
     {
@@ -446,27 +390,24 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
         _cts.Cancel();
         _renderChannel.Writer.Complete();
-        _renderTask.Wait(TimeSpan.FromSeconds(5));
+        try { _renderTask.Wait(TimeSpan.FromSeconds(5)); } catch { /* best effort */ }
         _cts.Dispose();
-        _renderingService.Dispose();
+        _pdfiumService.Dispose();
     }
 
-    // --- 其余 IList 接口 ---
+    // ════════════════════════════════════════════════════════════
+    //  Remaining IList members (unused by ItemsRepeater)
+    // ════════════════════════════════════════════════════════════
+
     public bool IsFixedSize => true;
     public bool IsReadOnly => true;
 
     public bool Contains(object? value) => false;
-
     public int IndexOf(object? value) => -1;
-
     public void Clear() { }
-
     public void Insert(int index, object? value) { }
-
     public void Remove(object? value) { }
-
     public void RemoveAt(int index) { }
-
     public void CopyTo(Array array, int index) { }
 
     public bool IsSynchronized => false;
