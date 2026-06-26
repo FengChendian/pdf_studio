@@ -4,38 +4,12 @@ using PDFiumCore;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
-using System.Threading.Tasks;
 
 namespace pdf_studio.Services
 {
     internal class PDFiumService : IDisposable
     {
-        /// <summary>
-        /// Holds a document handle together with the native memory buffer that
-        /// backs it. PDFium reads directly from this buffer, so it must remain
-        /// alive and unpinned for the document's entire lifetime.
-        /// </summary>
-        private sealed class DocumentSlot
-        {
-            public FpdfDocumentT Document;
-            public IntPtr Buffer;
-
-            public void Dispose()
-            {
-                fpdfview.FPDF_CloseDocument(Document);
-                Marshal.FreeHGlobal(Buffer);
-            }
-        }
-
-        /// <summary>
-        /// Document pool: filePath → array of independent document instances.
-        /// Each slot is backed by its own copy of the file bytes, allocated in
-        /// native memory so PDFium can read from it without filesystem contention.
-        /// </summary>
-        private readonly Dictionary<string, DocumentSlot[]> _documentPool = new();
-        private readonly object _poolLock = new();
         private bool _disposed;
 
         public PDFiumService()
@@ -100,8 +74,7 @@ namespace pdf_studio.Services
         }
 
         /// <summary>
-        /// Renders multiple pages in parallel into raw byte buffers.
-        /// Thread-safe — may be called from any thread.
+        /// Renders multiple pages into raw byte buffers.
         /// </summary>
         public (int width, int height, byte[] pixels)[] RenderPagesToRawBuffers(
             string filePath,
@@ -131,7 +104,7 @@ namespace pdf_studio.Services
         }
 
         // ════════════════════════════════════════════════════════════════
-        //  Batch parallel convenience (UI-thread only — creates WriteableBitmaps)
+        //  Batch convenience (UI-thread only — creates WriteableBitmaps)
         // ════════════════════════════════════════════════════════════════
 
         public Dictionary<int, WriteableBitmap> RenderPagesToWriteableBitmaps(
@@ -169,7 +142,7 @@ namespace pdf_studio.Services
         }
 
         // ════════════════════════════════════════════════════════════════
-        //  Core parallel rendering (thread-safe — raw bytes only, no UI types)
+        //  Core rendering (raw bytes only, no UI types)
         // ════════════════════════════════════════════════════════════════
 
         private void RenderPagesToRawBuffersInternal(
@@ -180,43 +153,18 @@ namespace pdf_studio.Services
         {
             if (pageNumbers.Length == 0) return;
 
-            int threadCount = Math.Min(pageNumbers.Length, 2);
-            threadCount = Math.Max(threadCount, 1);
-
-            var documents = GetOrCreateDocumentPool(filePath, threadCount);
-
-            // Manually distribute pages across N tasks, each with its own
-            // dedicated document instance. No contention: every page index is
-            // written by exactly one worker, every worker owns exactly one
-            // document handle.
-            int pagesPerThread = pageNumbers.Length / threadCount;
-            int remainder = pageNumbers.Length % threadCount;
-
-            var tasks = new Task[threadCount];
-            int offset = 0;
-            for (int t = 0; t < threadCount; t++)
+            var document = fpdfview.FPDF_LoadDocument(filePath, null);
+            try
             {
-                int threadIndex = t;
-                int start = offset;
-                int count = pagesPerThread + (t < remainder ? 1 : 0);
-                offset += count;
-
-                int localStart = start;
-                int localCount = count;
-
-                tasks[t] = Task.Run(() =>
+                for (int i = 0; i < pageNumbers.Length; i++)
                 {
-                    var doc = documents[threadIndex].Document;
-                    for (int j = 0; j < localCount; j++)
-                    {
-                        int pageIdx = localStart + j; // 使用快照
-                        output[pageIdx] = RenderSinglePageToBuffer(
-                            doc, pageNumbers[pageIdx], scale);
-                    }
-                });
+                    output[i] = RenderSinglePageToBuffer(document, pageNumbers[i], scale);
+                }
             }
-
-            Task.WaitAll(tasks);
+            finally
+            {
+                fpdfview.FPDF_CloseDocument(document);
+            }
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -352,85 +300,6 @@ namespace pdf_studio.Services
         }
 
         // ════════════════════════════════════════════════════════════════
-        //  Document pool management
-        // ════════════════════════════════════════════════════════════════
-
-        /// <summary>
-        /// Gets or creates a pool of independent document instances, each backed
-        /// by its own copy of the file in native memory. This eliminates
-        /// filesystem-level contention when multiple threads render concurrently.
-        /// </summary>
-        private DocumentSlot[] GetOrCreateDocumentPool(string filePath, int count)
-        {
-            lock (_poolLock)
-            {
-                if (_documentPool.TryGetValue(filePath, out var existing))
-                {
-                    if (existing.Length >= count)
-                        return existing;
-
-                    // Grow the pool — only create the additional slots.
-                    var expanded = new DocumentSlot[count];
-                    Array.Copy(existing, expanded, existing.Length);
-                    for (int i = existing.Length; i < count; i++)
-                        expanded[i] = CreateDocumentSlot(filePath);
-                    _documentPool[filePath] = expanded;
-                    return expanded;
-                }
-                else
-                {
-                    var pool = new DocumentSlot[count];
-                    for (int i = 0; i < count; i++)
-                        pool[i] = CreateDocumentSlot(filePath);
-                    _documentPool[filePath] = pool;
-                    return pool;
-                }
-            }
-        }
-
-        /// <summary>
-        /// Reads the file once, copies the bytes into native memory, then opens
-        /// a PDFium document from that memory. The native buffer stays alive
-        /// until <see cref="DocumentSlot.Dispose"/> is called.
-        /// </summary>
-        private static DocumentSlot CreateDocumentSlot(string filePath)
-        {
-            byte[] fileBytes = File.ReadAllBytes(filePath);
-            int size = fileBytes.Length;
-
-            IntPtr buffer = Marshal.AllocHGlobal(size);
-            Marshal.Copy(fileBytes, 0, buffer, size);
-
-            var document = fpdfview.FPDF_LoadMemDocument(buffer, size, null);
-            return new DocumentSlot { Document = document, Buffer = buffer };
-        }
-
-        public void EvictDocument(string filePath)
-        {
-            lock (_poolLock)
-            {
-                if (_documentPool.Remove(filePath, out var slots))
-                {
-                    foreach (var slot in slots)
-                        slot.Dispose();
-                }
-            }
-        }
-
-        public void EvictAllDocuments()
-        {
-            lock (_poolLock)
-            {
-                foreach (var (_, slots) in _documentPool)
-                {
-                    foreach (var slot in slots)
-                        slot.Dispose();
-                }
-                _documentPool.Clear();
-            }
-        }
-
-        // ════════════════════════════════════════════════════════════════
         //  IDisposable
         // ════════════════════════════════════════════════════════════════
 
@@ -439,7 +308,6 @@ namespace pdf_studio.Services
             if (_disposed) return;
             _disposed = true;
 
-            EvictAllDocuments();
             fpdfview.FPDF_DestroyLibrary();
         }
     }

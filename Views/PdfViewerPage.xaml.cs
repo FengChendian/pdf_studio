@@ -4,7 +4,9 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -13,6 +15,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media.Imaging;
 using pdf_studio.Services;
+using Windows.Graphics.Imaging;
+using Windows.Storage.Streams;
 
 namespace pdf_studio.Views;
 
@@ -81,7 +85,7 @@ public sealed partial class PdfViewerPage : Page
         _zoomDebounceTimer?.Stop();
 
         bool shouldBeHighDpi = PdfScrollViewer.ZoomFactor >= ZoomThreshold;
-        Debug.WriteLine($"zoom: {PdfScrollViewer.ZoomFactor}");
+        //Debug.WriteLine($"zoom: {PdfScrollViewer.ZoomFactor}");
         if (shouldBeHighDpi != _isHighDpiMode)
         {
             _isHighDpiMode = shouldBeHighDpi;
@@ -152,13 +156,18 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
     internal async Task InitializePlaceholdersAsync()
     {
+        var swTotal = Stopwatch.StartNew();
         int[] allPages = Enumerable.Range(0, _pageCount).ToArray();
 
         // Phase 1 — background thread: parallel PDFium render to raw bytes.
+        var swPhase1 = Stopwatch.StartNew();
         var rawBuffers = await Task.Run(() =>
             _pdfiumService.RenderPagesToRawBuffers(_filePath, allPages, scale: 1f));
+        swPhase1.Stop();
+        Debug.WriteLine($"[PDFium] Phase 1 (render {_pageCount} pages) took {swPhase1.Elapsed.TotalMilliseconds:F1} ms");
 
         // Phase 2 — UI thread: create WriteableBitmap from raw bytes.
+        var swPhase2 = Stopwatch.StartNew();
         for (int i = 0; i < _pageCount; i++)
         {
             var (w, h, pixels) = rawBuffers[i];
@@ -166,8 +175,109 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             _pageSizes[i] = (w, h);
             _placeHolderCache[i] = new PageImageItem { Image = bitmap };
         }
+        swPhase2.Stop();
+        Debug.WriteLine($"[PDFium] Phase 2 (create bitmaps) took {swPhase2.Elapsed.TotalMilliseconds:F1} ms");
 
-        Debug.WriteLine($"[PDFium] Batch-rendered {_pageCount} placeholder pages in parallel");
+        swTotal.Stop();
+        Debug.WriteLine($"[PDFium] InitializePlaceholdersAsync total: {swTotal.Elapsed.TotalMilliseconds:F1} ms");
+
+//#if DEBUG
+//        await EvaluatePlaceholderCacheMemoryAsync();
+//#endif
+    }
+
+    private async Task EvaluatePlaceholderCacheMemoryAsync()
+    {
+        long totalPixels = 0;
+        long totalBitmapBytes = 0;
+        long totalPngBytes = 0;
+        int entriesWithImage = 0;
+        int entriesWithoutImage = 0;
+        long managedOverhead = 0;
+
+        foreach (var kvp in _placeHolderCache)
+        {
+            var item = kvp.Value;
+            if (item?.Image is { } bitmap)
+            {
+                entriesWithImage++;
+                int w = bitmap.PixelWidth;
+                int h = bitmap.PixelHeight;
+                long pixels = (long)w * h;
+                totalPixels += pixels;
+                // WriteableBitmap is BGRA32 = 4 bytes per pixel
+                long bitmapBytes = pixels * 4;
+                totalBitmapBytes += bitmapBytes;
+                // Managed object overhead estimate per PageImageItem + WriteableBitmap
+                managedOverhead += 128; // ~64 bytes per object
+
+                // Encode as PNG to measure compressed size
+                try
+                {
+                    byte[] pixelData;
+                    using (var pixelStream = bitmap.PixelBuffer.AsStream())
+                    {
+                        pixelData = new byte[pixelStream.Length];
+                        pixelStream.Read(pixelData, 0, pixelData.Length);
+                    }
+
+                    var stream = new InMemoryRandomAccessStream();
+                    var encoder = await BitmapEncoder.CreateAsync(BitmapEncoder.PngEncoderId, stream);
+                    encoder.SetPixelData(
+                        BitmapPixelFormat.Bgra8,
+                        BitmapAlphaMode.Premultiplied,
+                        (uint)w, (uint)h,
+                        96, 96,
+                        pixelData);
+                    await encoder.FlushAsync();
+                    totalPngBytes += (long)stream.Size;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[PDFium] PNG encode failed for page {kvp.Key}: {ex.Message}");
+                }
+            }
+            else
+            {
+                entriesWithoutImage++;
+            }
+        }
+
+        // Dictionary overhead: buckets + entries (approximate)
+        long dictOverhead = _placeHolderCache.Count * 48;
+
+        long estimatedTotal = totalBitmapBytes + managedOverhead + dictOverhead;
+        double totalMB = estimatedTotal / (1024.0 * 1024.0);
+
+        double rawMB = totalBitmapBytes / (1024.0 * 1024.0);
+        double pngMB = totalPngBytes / (1024.0 * 1024.0);
+        double ratio = totalBitmapBytes > 0
+            ? (double)totalPngBytes / totalBitmapBytes * 100
+            : 0;
+
+        Debug.WriteLine(
+            $"[PDFium] _placeHolderCache memory — " +
+            $"entries: {_placeHolderCache.Count} " +
+            $"(with image: {entriesWithImage}, w/o image: {entriesWithoutImage}), " +
+            $"total pixels: {totalPixels:N0}, " +
+            $"raw BGRA32: {rawMB:F1} MB, " +
+            $"PNG compressed: {pngMB:F1} MB ({ratio:F1}%), " +
+            $"estimated total: {totalMB:F1} MB");
+
+        // Per-page breakdown for large caches (>10 pages)
+        if (_placeHolderCache.Count > 10)
+        {
+            long avgBitmapKB = entriesWithImage > 0
+                ? totalBitmapBytes / entriesWithImage / 1024
+                : 0;
+            long avgPngKB = entriesWithImage > 0
+                ? totalPngBytes / entriesWithImage / 1024
+                : 0;
+            Debug.WriteLine(
+                $"[PDFium] _placeHolderCache per-page avg: raw {avgBitmapKB} KB, " +
+                $"PNG {avgPngKB} KB " +
+                $"({totalBitmapBytes / 1024 / 1024} MB → {totalPngBytes / 1024 / 1024} MB / {entriesWithImage} bitmaps)");
+        }
     }
 
     // ════════════════════════════════════════════════════════════
