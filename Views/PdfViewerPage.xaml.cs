@@ -135,7 +135,8 @@ public sealed partial class PdfViewerPage : Page
         if (hit.Image == null || hit.Item == null) return;
 
         var (pwPt, phPt) = VirtualizingImages.GetPageSizeInPoints(hit.Item.PageIndex);
-        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt);
+        var (oLeft, oBottom) = VirtualizingImages.GetPageOrigin(hit.Item.PageIndex);
+        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt, oLeft, oBottom);
         if (pdfPoint == null) return;
 
         var textPage = LoadTextPageForSelection(hit.Item.PageIndex);
@@ -170,7 +171,8 @@ public sealed partial class PdfViewerPage : Page
         if (curTextPage == null) return;
 
         var (pwPt, phPt) = VirtualizingImages.GetPageSizeInPoints(curPage);
-        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt);
+        var (oLeft, oBottom) = VirtualizingImages.GetPageOrigin(curPage);
+        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt, oLeft, oBottom);
         if (pdfPoint == null) return;
 
         int charIndex = PDFiumService.TextGetCharIndexAtPos(
@@ -274,7 +276,8 @@ public sealed partial class PdfViewerPage : Page
     /// Returns null when the image has no bitmap yet.
     /// </summary>
     private static Point? ImagePointToPdf(Image image, PageImageItem item,
-        Point imageLocalPoint, double pageWidthPt, double pageHeightPt)
+        Point imageLocalPoint, double pageWidthPt, double pageHeightPt,
+        double originLeft, double originBottom)
     {
         if (item.Image is not { } bitmap) return null;
 
@@ -296,8 +299,8 @@ public sealed partial class PdfViewerPage : Page
         double bitmapY = Math.Clamp(imageLocalPoint.Y - offsetY, 0, displayedH);
 
         // Fraction within the displayed bitmap → PDF points.
-        double pdfX = (bitmapX / displayedW) * pageWidthPt;
-        double pdfY = pageHeightPt - (bitmapY / displayedH) * pageHeightPt; // flip Y
+        double pdfX = originLeft + (bitmapX / displayedW) * pageWidthPt;
+        double pdfY = originBottom + pageHeightPt - (bitmapY / displayedH) * pageHeightPt; // flip Y
 
         return new Point(pdfX, pdfY);
     }
@@ -344,7 +347,8 @@ public sealed partial class PdfViewerPage : Page
         }
 
         var (pwPt, phPt) = VirtualizingImages.GetPageSizeInPoints(hit.Item.PageIndex);
-        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt);
+        var (oLeft, oBottom) = VirtualizingImages.GetPageOrigin(hit.Item.PageIndex);
+        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt, oLeft, oBottom);
         if (pdfPoint == null)
         {
             ProtectedCursor = null;
@@ -492,14 +496,15 @@ public sealed partial class PdfViewerPage : Page
         double offsetY = (imgH - displayedH) / 2;
 
         var (pageW, pageH) = VirtualizingImages.GetPageSizeInPoints(pageIndex);
+        var (originLeft, originBottom) = VirtualizingImages.GetPageOrigin(pageIndex);
         double scaleX = displayedW / pageW;
         double scaleY = displayedH / pageH;
 
         // ── 4. Draw merged rects ─────────────────────────────────────
         foreach (var (l, t, r, b) in merged)
         {
-            double winX = imageOrigin.X + offsetX + l * scaleX;
-            double winY = imageOrigin.Y + offsetY + (pageH - t) * scaleY;
+            double winX = imageOrigin.X + offsetX + (l - originLeft) * scaleX;
+            double winY = imageOrigin.Y + offsetY + (originBottom + pageH - t) * scaleY;
             double winW = (r - l) * scaleX;
             double winH = (t - b) * scaleY;
             if (winW <= 0 || winH <= 0) continue;
@@ -724,6 +729,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     private const int MaxHighResCacheSize = 5;
     private volatile int _currentRenderDpi = 400;
     private readonly Dictionary<int, (double Width, double Height)> _pageSizes = [];
+    private readonly Dictionary<int, (double Left, double Bottom)> _pageOrigins = [];
     private readonly Dictionary<int, double> _displayWidths = [];
     private double _containerWidth;
     private readonly string _filePath;
@@ -780,6 +786,13 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         }
         swPhase2.Stop();
         Debug.WriteLine($"[PDFium] Phase 2 (create bitmaps) took {swPhase2.Elapsed.TotalMilliseconds:F1} ms");
+
+        // Phase 2b — load page-bounding-box origins for correct coordinate mapping.
+        var bboxes = _pdfiumService.GetAllPageBBoxes(_filePath);
+        for (int i = 0; i < bboxes.Length; i++)
+        {
+            _pageOrigins[i] = (bboxes[i].Left, bboxes[i].Bottom);
+        }
 
         swTotal.Stop();
         Debug.WriteLine($"[PDFium] InitializePlaceholdersAsync total: {swTotal.Elapsed.TotalMilliseconds:F1} ms");
@@ -1063,6 +1076,14 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         if (_pageSizes.TryGetValue(pageIndex, out var size))
             return size; // scale=1 → pixels = points
         return (612, 792); // fallback: US Letter
+    }
+
+    /// <summary>CropBox/MediaBox origin offset (left, bottom) in PDF points.</summary>
+    public (double Left, double Bottom) GetPageOrigin(int pageIndex)
+    {
+        if (_pageOrigins.TryGetValue(pageIndex, out var origin))
+            return origin;
+        return (0, 0);
     }
 
     /// <summary>Underlying PDFium service — used by text selection layer.</summary>

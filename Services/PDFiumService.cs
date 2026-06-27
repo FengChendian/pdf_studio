@@ -453,6 +453,59 @@ namespace pdf_studio.Services
         }
 
         // ════════════════════════════════════════════════════════════════
+        //  Page bounding-box (CropBox / MediaBox origins)
+        // ════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Returns the full bounding box (left, bottom, right, top) for every
+        /// page in the document.  Uses the CropBox when present; falls back
+        /// to the MediaBox.  The origin (<c>left</c>, <c>bottom</c>) is
+        /// essential for correct coordinate mapping when the visible page
+        /// area does not start at (0, 0).
+        /// </summary>
+        public (double Left, double Bottom, double Right, double Top)[] GetAllPageBBoxes(
+            string filePath)
+        {
+            var document = fpdfview.FPDF_LoadDocument(filePath, null);
+            try
+            {
+                int count = fpdfview.FPDF_GetPageCount(document);
+                var result = new (double, double, double, double)[count];
+                for (int i = 0; i < count; i++)
+                {
+                    FpdfPageT page;
+                    lock (_pageLock)
+                    {
+                        page = fpdfview.FPDF_LoadPage(document, i);
+                    }
+                    try
+                    {
+                        float left = 0, bottom = 0, right = 0, top = 0;
+                        if (fpdf_transformpage.FPDFPageGetCropBox(page, ref left, ref bottom,
+                                ref right, ref top) == 0)
+                        {
+                            fpdf_transformpage.FPDFPageGetMediaBox(page, ref left, ref bottom,
+                                ref right, ref top);
+                        }
+                        result[i] = (left, bottom, right, top);
+                    }
+                    finally
+                    {
+                        lock (_pageLock)
+                        {
+                            fpdfview.FPDF_ClosePage(page);
+                        }
+                    }
+                }
+                return result;
+            }
+            finally
+            {
+                fpdfview.FPDF_CloseDocument(document);
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════
         //  IDisposable
         // ════════════════════════════════════════════════════════════════
 
