@@ -2,15 +2,23 @@ using Microsoft.UI.Xaml.Media.Imaging;
 using mupdf;
 using PDFiumCore;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Text;
 
 namespace pdf_studio.Services
 {
-    internal class PDFiumService : IDisposable
+    public class PDFiumService : IDisposable
     {
         private bool _disposed;
+
+        // ── Text-page cache ──────────────────────────────────────────
+        // Key: filePath|pageIndex  — simple string key to avoid holding
+        // document/page handles across calls.
+        private readonly ConcurrentDictionary<string, FpdfTextpageT> _textPageCache = new();
+        private readonly ConcurrentDictionary<string, FpdfDocumentT> _textDocCache = new();
 
         public PDFiumService()
         {
@@ -300,6 +308,151 @@ namespace pdf_studio.Services
         }
 
         // ════════════════════════════════════════════════════════════════
+        //  Text page APIs (text selection / highlighting)
+        // ════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Loads a text page for the given PDF page.  Opens the document
+        /// on first call and caches both the document handle and the text
+        /// page.  Call <see cref="ReleaseTextPage"/> when done.
+        /// </summary>
+        public FpdfTextpageT LoadTextPage(string filePath, int pageIndex)
+        {
+            string docKey = filePath;
+            string pageKey = $"{filePath}|{pageIndex}";
+
+            if (_textPageCache.TryGetValue(pageKey, out var cached))
+                return cached;
+
+            if (!_textDocCache.TryGetValue(docKey, out var document))
+            {
+                document = fpdfview.FPDF_LoadDocument(filePath, null);
+                if (document == null)
+                    throw new Exception($"Failed to open PDF for text: {filePath}");
+                _textDocCache[docKey] = document;
+            }
+
+            FpdfTextpageT textPage;
+            lock (_pageLock)
+            {
+                var page = fpdfview.FPDF_LoadPage(document, pageIndex);
+                try
+                {
+                    textPage = fpdf_text.FPDFTextLoadPage(page);
+                }
+                finally
+                {
+                    fpdfview.FPDF_ClosePage(page);
+                }
+            }
+
+            _textPageCache[pageKey] = textPage;
+            return textPage;
+        }
+
+        /// <summary>
+        /// Releases a single cached text page.
+        /// </summary>
+        public void ReleaseTextPage(string filePath, int pageIndex)
+        {
+            string pageKey = $"{filePath}|{pageIndex}";
+            if (_textPageCache.TryRemove(pageKey, out var textPage))
+            {
+                fpdf_text.FPDFTextClosePage(textPage);
+            }
+        }
+
+        /// <summary>
+        /// Releases all cached text pages and document handles.
+        /// Called when the PDF viewer page is unloaded.
+        /// </summary>
+        public void ReleaseAllTextPages()
+        {
+            foreach (var kv in _textPageCache)
+            {
+                fpdf_text.FPDFTextClosePage(kv.Value);
+            }
+            _textPageCache.Clear();
+
+            foreach (var kv in _textDocCache)
+            {
+                fpdfview.FPDF_CloseDocument(kv.Value);
+            }
+            _textDocCache.Clear();
+        }
+
+        /// <summary>
+        /// Releases all text pages for a given file (keeps the document
+        /// open if it may be reused).
+        /// </summary>
+        public void ReleaseTextPagesForFile(string filePath)
+        {
+            var keysToRemove = new List<string>();
+            foreach (var key in _textPageCache.Keys)
+            {
+                if (key.StartsWith(filePath + "|"))
+                    keysToRemove.Add(key);
+            }
+            foreach (var key in keysToRemove)
+            {
+                if (_textPageCache.TryRemove(key, out var textPage))
+                    fpdf_text.FPDFTextClosePage(textPage);
+            }
+        }
+
+        // ── Lightweight wrappers (delegate directly to fpdf_text) ─────
+
+        public static int TextGetCharIndexAtPos(FpdfTextpageT textPage, double x, double y, double xTol, double yTol)
+            => fpdf_text.FPDFTextGetCharIndexAtPos(textPage, x, y, xTol, yTol);
+
+        public static int TextCountRects(FpdfTextpageT textPage, int startIndex, int count)
+            => fpdf_text.FPDFTextCountRects(textPage, startIndex, count);
+
+        public static bool TextGetRect(FpdfTextpageT textPage, int rectIndex, out double left, out double top, out double right, out double bottom)
+        {
+            left = top = right = bottom = 0;
+            return fpdf_text.FPDFTextGetRect(textPage, rectIndex, ref left, ref top, ref right, ref bottom) != 0;
+        }
+
+        public static int TextCountChars(FpdfTextpageT textPage)
+            => fpdf_text.FPDFTextCountChars(textPage);
+
+        /// <summary>
+        /// Extracts the selected text (UTF-16) and returns it as a .NET string.
+        /// </summary>
+        public static unsafe string TextGetText(FpdfTextpageT textPage, int startIndex, int count)
+        {
+            if (count <= 0) return string.Empty;
+
+            var buffer = new ushort[count + 1]; // +1 for null terminator
+            int written;
+            fixed (ushort* ptr = buffer)
+            {
+                written = fpdf_text.FPDFTextGetText(textPage, startIndex, count, ref ptr[0]);
+            }
+
+            if (written <= 0) return string.Empty;
+
+            // written includes the null terminator
+            int charCount = written - 1;
+            if (charCount <= 0) return string.Empty;
+
+            return new string(
+                Array.ConvertAll(buffer.AsSpan(0, charCount).ToArray(), u => (char)u));
+        }
+
+        /// <summary>
+        /// Gets page dimensions in PDF points (1/72 inch) from an
+        /// already-open document.
+        /// </summary>
+        public static (double Width, double Height) GetPageSizePt(FpdfDocumentT document, int pageIndex)
+        {
+            double w = 0, h = 0;
+            fpdfview.FPDF_GetPageSizeByIndex(document, pageIndex, ref w, ref h);
+            return (w, h);
+        }
+
+        // ════════════════════════════════════════════════════════════════
         //  IDisposable
         // ════════════════════════════════════════════════════════════════
 
@@ -308,6 +461,7 @@ namespace pdf_studio.Services
             if (_disposed) return;
             _disposed = true;
 
+            ReleaseAllTextPages();
             fpdfview.FPDF_DestroyLibrary();
         }
     }

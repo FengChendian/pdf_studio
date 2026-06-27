@@ -63,25 +63,40 @@
       Height="Auto"
       ViewChanged="PdfScrollViewer_ViewChanged"
       SizeChanged="PdfScrollViewer_SizeChanged"
+      PointerPressed="PdfScrollViewer_PointerPressed"
+      PointerMoved="PdfScrollViewer_PointerMoved"
+      PointerReleased="PdfScrollViewer_PointerReleased"
+      PointerExited="PdfScrollViewer_PointerExited"
     >
-      <ItemsRepeater
-        x:Name="PagesRepeater"
-        HorizontalAlignment="Center"
-        Margin="32"
-        ItemsSource="{x:Bind VirtualizingImages, Mode=OneWay}"
-      >
-        <ItemsRepeater.Layout>
-          <StackLayout Orientation="Vertical" Spacing="16" />
-        </ItemsRepeater.Layout>
+      <Grid>
+        <ItemsRepeater
+          x:Name="PagesRepeater"
+          HorizontalAlignment="Center"
+          Margin="32"
+          ItemsSource="{x:Bind VirtualizingImages, Mode=OneWay}"
+        >
+          <ItemsRepeater.Layout>
+            <StackLayout Orientation="Vertical" Spacing="16" />
+          </ItemsRepeater.Layout>
 
-        <ItemsRepeater.ItemTemplate>
-          <DataTemplate>
-            <Border Width="{Binding ContainerWidth}">
-              <Image Source="{Binding Image}" Width="{Binding Width}" Height="{Binding Height}" Stretch="Uniform" HorizontalAlignment="Center" />
-            </Border>
-          </DataTemplate>
-        </ItemsRepeater.ItemTemplate>
-      </ItemsRepeater>
+          <ItemsRepeater.ItemTemplate>
+            <DataTemplate>
+              <Border Width="{Binding ContainerWidth}">
+                <Image Source="{Binding Image}" Width="{Binding Width}" Height="{Binding Height}" Stretch="Uniform" HorizontalAlignment="Center" />
+              </Border>
+            </DataTemplate>
+          </ItemsRepeater.ItemTemplate>
+        </ItemsRepeater>
+
+        <!-- Text-selection highlight overlay — drawn on top of all pages.
+             IsHitTestVisible="False" so pointer events pass through to ScrollView. -->
+        <Canvas
+          x:Name="HighlightOverlay"
+          IsHitTestVisible="False"
+          HorizontalAlignment="Stretch"
+          VerticalAlignment="Stretch"
+        />
+      </Grid>
     </ScrollView>
   </Grid>
 </Page>
