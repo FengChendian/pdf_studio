@@ -14,6 +14,10 @@ namespace pdf_studio.Services
     {
         private bool _disposed;
 
+        // ── Library lifecycle (reference-counted — init once, destroy on last Dispose) ──
+        private static int _libraryRefCount;
+        private static readonly object _libraryLock = new();
+
         // ── Text-page cache ──────────────────────────────────────────
         // Key: filePath|pageIndex  — simple string key to avoid holding
         // document/page handles across calls.
@@ -22,7 +26,12 @@ namespace pdf_studio.Services
 
         public PDFiumService()
         {
-            fpdfview.FPDF_InitLibrary();
+            lock (_libraryLock)
+            {
+                if (_libraryRefCount == 0)
+                    fpdfview.FPDF_InitLibrary();
+                _libraryRefCount++;
+            }
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -515,7 +524,13 @@ namespace pdf_studio.Services
             _disposed = true;
 
             ReleaseAllTextPages();
-            fpdfview.FPDF_DestroyLibrary();
+
+            lock (_libraryLock)
+            {
+                _libraryRefCount--;
+                if (_libraryRefCount == 0)
+                    fpdfview.FPDF_DestroyLibrary();
+            }
         }
     }
 }

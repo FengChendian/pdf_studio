@@ -77,6 +77,8 @@ public sealed partial class PdfViewerPage : Page
 
     private void PdfScrollViewer_ViewChanged(ScrollView sender, object args)
     {
+        return;
+        Debug.WriteLine("PdfScrollViewer_ViewChanged");
         if (_zoomDebounceTimer == null)
         {
             _zoomDebounceTimer = new DispatcherTimer
@@ -938,7 +940,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             }
         }
 
-        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+         OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
     }
 
     // ════════════════════════════════════════════════════════════
@@ -981,7 +983,8 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                 if (!_renderChannel.Reader.TryRead(out var index))
                     continue;
 
-                // Check high-res cache — if already present, move to LRU tail & skip.
+                // Check high-res cache — if already present, move to LRU tail & notify UI.
+                PageImageItem? cachedItem = null;
                 lock (_cacheLock)
                 {
                     var node = _highResCache.First;
@@ -992,11 +995,29 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                             var value = node.Value;
                             _highResCache.Remove(node);
                             _highResCache.AddLast(value);
+                            cachedItem = value.Value;
                             break;
                         }
                         node = node.Next;
                     }
-                    if (node != null) continue;
+                }
+
+                if (cachedItem != null)
+                {
+                    _dispatcher.TryEnqueue(() =>
+                    {
+                        _placeHolderCache.TryGetValue(index, out var oldValue);
+                        Debug.WriteLine("Loop rerender in cache");
+                        OnCollectionChanged(
+                            new NotifyCollectionChangedEventArgs(
+                                NotifyCollectionChangedAction.Replace,
+                                cachedItem,
+                                oldValue,
+                                index
+                            )
+                        );
+                    });
+                    continue;
                 }
 
                 // Phase 1 — background thread: PDFium render to raw bytes.
@@ -1100,18 +1121,19 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     {
         get
         {
+            Debug.WriteLine("Get index {0}", index);
             lock (_cacheLock)
             {
-                for (var node = _highResCache.First; node != null; node = node.Next)
-                {
-                    if (node.Value.Key == index)
-                    {
-                        var value = node.Value;
-                        _highResCache.Remove(node);
-                        _highResCache.AddLast(value);
-                        return value.Value;
-                    }
-                }
+               for (var node = _highResCache.First; node != null; node = node.Next)
+               {
+                   if (node.Value.Key == index)
+                   {
+                       var value = node.Value;
+                       _highResCache.Remove(node);
+                       _highResCache.AddLast(value);
+                       return value.Value;
+                   }
+               }
             }
 
             EnqueueRender(index);
