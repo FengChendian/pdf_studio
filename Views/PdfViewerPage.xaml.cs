@@ -117,8 +117,10 @@ public sealed partial class PdfViewerPage : Page
     private int _selectionStartChar = -1;
     private int _selectionEndChar = -1;
 
-    // Cursor-tracking state (throttled to avoid per-pixel text-page queries)
-    private Point _lastCursorCheckPoint;
+    // Cursor-tracking state (throttled to avoid per-pixel text-page queries).
+    // Compared in PDF coordinates, so we never need GetCurrentPoint(ScrollView)
+    // during PointerMoved — eliminating ScrollView‑internal state flushes.
+    private Point _lastCursorCheckPdfPoint;
     private int _lastCursorCheckPage = -1;
 
     /// <summary>Highlight colour: semi-transparent blue (#0078D7 @ 40%).</summary>
@@ -133,15 +135,10 @@ public sealed partial class PdfViewerPage : Page
     {
         ClearSelection();
 
-        var hit = HitTestPageImage(e);
-        if (hit.Image == null || hit.Item == null) return;
+        var (item, pdfPoint) = HitTestPageImage(e);
+        if (item == null || pdfPoint == null) return;
 
-        var (pwPt, phPt) = VirtualizingImages.GetPageSizeInPoints(hit.Item.PageIndex);
-        var (oLeft, oBottom) = VirtualizingImages.GetPageOrigin(hit.Item.PageIndex);
-        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt, oLeft, oBottom);
-        if (pdfPoint == null) return;
-
-        var textPage = LoadTextPageForSelection(hit.Item.PageIndex);
+        var textPage = LoadTextPageForSelection(item.PageIndex);
         if (textPage == null) return;
 
         int charIndex = PDFiumService.TextGetCharIndexAtPos(
@@ -149,8 +146,8 @@ public sealed partial class PdfViewerPage : Page
         if (charIndex < 0) return;
 
         _isSelecting = true;
-        _selectionStartPage = hit.Item.PageIndex;
-        _selectionEndPage = hit.Item.PageIndex;
+        _selectionStartPage = item.PageIndex;
+        _selectionEndPage = item.PageIndex;
         _selectionStartChar = charIndex;
         _selectionEndChar = charIndex;
 
@@ -165,17 +162,12 @@ public sealed partial class PdfViewerPage : Page
             return;
         }
 
-        var hit = HitTestPageImage(e);
-        if (hit.Image == null || hit.Item == null) return;
+        var (item, pdfPoint) = HitTestPageImage(e);
+        if (item == null || pdfPoint == null) return;
 
-        int curPage = hit.Item.PageIndex;
+        int curPage = item.PageIndex;
         var curTextPage = LoadTextPageForSelection(curPage);
         if (curTextPage == null) return;
-
-        var (pwPt, phPt) = VirtualizingImages.GetPageSizeInPoints(curPage);
-        var (oLeft, oBottom) = VirtualizingImages.GetPageOrigin(curPage);
-        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt, oLeft, oBottom);
-        if (pdfPoint == null) return;
 
         int charIndex = PDFiumService.TextGetCharIndexAtPos(
             curTextPage, pdfPoint.Value.X, pdfPoint.Value.Y, 10, 10);
@@ -205,6 +197,7 @@ public sealed partial class PdfViewerPage : Page
     {
         ProtectedCursor = null;
         _lastCursorCheckPage = -1;
+        _lastCursorCheckPdfPoint = default;
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -212,23 +205,31 @@ public sealed partial class PdfViewerPage : Page
     // ════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Finds the <see cref="Image"/> element under the pointer and returns
-    /// its data context plus the local pointer position.
+    /// Hit-tests the pointer against the known page layout and returns the
+    /// matching <see cref="PageImageItem"/> together with the corresponding
+    /// PDF user-space coordinate.
     /// </summary>
-    private (Image? Image, PageImageItem? Item, Point LocalPoint) HitTestPageImage(
+    /// <remarks>
+    /// The computation uses only the cached 72‑DPI page dimensions and
+    /// layout geometry — no visual‑tree walk or element realisation is needed,
+    /// so this runs cheaply even on every <c>PointerMoved</c>.
+    /// </remarks>
+    private (PageImageItem? Item, Point? PdfPoint) HitTestPageImage(
         PointerRoutedEventArgs e)
     {
-        // Compute which page the pointer is over by walking the known
-        // page layout (avoids ItemsRepeater hit-test quirks).
         var repeaterPoint = e.GetCurrentPoint(PagesRepeater).Position;
+        double containerWidth = VirtualizingImages.ContainerWidth;
+        if (containerWidth <= 0) return (null, null);
 
         double yCursor = 0;
         const double spacing = 16;
 
         for (int i = 0; i < VirtualizingImages.Count; i++)
         {
-            if (VirtualizingImages[i] is not PageImageItem item) continue;
-            if (item.Image is not { } bitmap) continue;
+            // Use GetPlaceholder (side‑effect‑free) — the indexer triggers
+            // EnqueueRender, which causes unwanted page reloads on every move.
+            var item = VirtualizingImages.GetPlaceholder(i);
+            if (item == null) continue;
 
             var (pageW, pageH) = VirtualizingImages.GetPageSizeInPoints(i);
             double dispW = item.Width;
@@ -240,20 +241,26 @@ public sealed partial class PdfViewerPage : Page
 
             if (repeaterPoint.Y >= pageTop && repeaterPoint.Y < pageBottom)
             {
-                // Found the page — get the visual Image element.
-                var element = PagesRepeater.GetOrCreateElement(i);
-                var image = FindImageInTree(element);
-                if (image != null)
-                {
-                    var localPoint = e.GetCurrentPoint(image).Position;
-                    return (image, item, localPoint);
-                }
+                // Found the page.
+                // Image is centred inside the Border (Border.Width == containerWidth).
+                double imageLeft = (containerWidth - dispW) / 2.0;
+
+                // Pointer position relative to the Image's display area.
+                double localX = Math.Clamp(repeaterPoint.X - imageLeft, 0, dispW);
+                double localY = Math.Clamp(repeaterPoint.Y - pageTop, 0, dispH);
+
+                // Fraction within the page display → PDF user-space.
+                var (originLeft, originBottom) = VirtualizingImages.GetPageOrigin(i);
+                double pdfX = originLeft + (localX / dispW) * pageW;
+                double pdfY = originBottom + pageH - (localY / dispH) * pageH;
+
+                return (item, new Point(pdfX, pdfY));
             }
 
             yCursor += dispH + spacing;
         }
 
-        return (null, null, default);
+        return (null, null);
     }
 
     /// <summary>Depth-first search for the first <see cref="Image"/> child.</summary>
@@ -272,41 +279,6 @@ public sealed partial class PdfViewerPage : Page
         return null;
     }
 
-    /// <summary>
-    /// Converts a point inside the <see cref="Image"/> element (in DIPs)
-    /// to PDF user-space coordinates (in points, origin bottom-left).
-    /// Returns null when the image has no bitmap yet.
-    /// </summary>
-    private static Point? ImagePointToPdf(Image image, PageImageItem item,
-        Point imageLocalPoint, double pageWidthPt, double pageHeightPt,
-        double originLeft, double originBottom)
-    {
-        if (item.Image is not { } bitmap) return null;
-
-        double imgW = image.ActualWidth;
-        double imgH = image.ActualHeight;
-        double bmpW = bitmap.PixelWidth;
-        double bmpH = bitmap.PixelHeight;
-
-        if (imgW <= 0 || imgH <= 0 || bmpW <= 0 || bmpH <= 0) return null;
-
-        // Uniform stretch: bitmap is centered inside the Image control.
-        double scale = Math.Min(imgW / bmpW, imgH / bmpH);
-        double displayedW = bmpW * scale;
-        double displayedH = bmpH * scale;
-        double offsetX = (imgW - displayedW) / 2;
-        double offsetY = (imgH - displayedH) / 2;
-
-        double bitmapX = Math.Clamp(imageLocalPoint.X - offsetX, 0, displayedW);
-        double bitmapY = Math.Clamp(imageLocalPoint.Y - offsetY, 0, displayedH);
-
-        // Fraction within the displayed bitmap → PDF points.
-        double pdfX = originLeft + (bitmapX / displayedW) * pageWidthPt;
-        double pdfY = originBottom + pageHeightPt - (bitmapY / displayedH) * pageHeightPt; // flip Y
-
-        return new Point(pdfX, pdfY);
-    }
-
     // ════════════════════════════════════════════════════════════════
     //  Text cursor (I‑beam when hovering over text)
     // ════════════════════════════════════════════════════════════════
@@ -318,40 +290,32 @@ public sealed partial class PdfViewerPage : Page
     /// </summary>
     private void UpdateTextCursor(PointerRoutedEventArgs e)
     {
-        var viewportPoint = e.GetCurrentPoint(PdfScrollViewer).Position;
-
-        // Throttle — skip tiny movements on the same page.
-        double dx = Math.Abs(viewportPoint.X - _lastCursorCheckPoint.X);
-        double dy = Math.Abs(viewportPoint.Y - _lastCursorCheckPoint.Y);
-        if (dx < 5 && dy < 5)
-            return;
-
-        var hit = HitTestPageImage(e);
-        if (hit.Image == null || hit.Item == null)
+        // HitTestPageImage is side‑effect‑free — no visual‑tree access, no
+        // render enqueue.  We get the PDF point back and throttle on that,
+        // avoiding e.GetCurrentPoint(ScrollView) which triggers ScrollView
+        // internal state flushes during PointerMoved.
+        var (item, pdfPoint) = HitTestPageImage(e);
+        if (item == null || pdfPoint == null)
         {
-            ProtectedCursor = null; // reset to default
+            ProtectedCursor = null;
             _lastCursorCheckPage = -1;
             return;
         }
 
-        // If we already know this page has no text, skip re-querying.
-        if (hit.Item.PageIndex == _lastCursorCheckPage && dx < 5 && dy < 5)
-            return;
-
-        _lastCursorCheckPoint = viewportPoint;
-        _lastCursorCheckPage = hit.Item.PageIndex;
-
-        var textPage = LoadTextPageForSelection(hit.Item.PageIndex);
-        if (textPage == null)
+        // Same page + tiny movement in PDF space → skip PDFium re-query.
+        if (item.PageIndex == _lastCursorCheckPage)
         {
-            ProtectedCursor = null;
-            return;
+            double dx = Math.Abs(pdfPoint.Value.X - _lastCursorCheckPdfPoint.X);
+            double dy = Math.Abs(pdfPoint.Value.Y - _lastCursorCheckPdfPoint.Y);
+            if (dx < 5 && dy < 5)
+                return;
         }
 
-        var (pwPt, phPt) = VirtualizingImages.GetPageSizeInPoints(hit.Item.PageIndex);
-        var (oLeft, oBottom) = VirtualizingImages.GetPageOrigin(hit.Item.PageIndex);
-        var pdfPoint = ImagePointToPdf(hit.Image, hit.Item, hit.LocalPoint, pwPt, phPt, oLeft, oBottom);
-        if (pdfPoint == null)
+        _lastCursorCheckPdfPoint = pdfPoint.Value;
+        _lastCursorCheckPage = item.PageIndex;
+
+        var textPage = LoadTextPageForSelection(item.PageIndex);
+        if (textPage == null)
         {
             ProtectedCursor = null;
             return;
@@ -732,7 +696,6 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     private volatile int _currentRenderDpi = 400;
     private readonly Dictionary<int, (double Width, double Height)> _pageSizes = [];
     private readonly Dictionary<int, (double Left, double Bottom)> _pageOrigins = [];
-    private readonly Dictionary<int, double> _displayWidths = [];
     private double _containerWidth;
     private readonly string _filePath;
     private readonly PDFiumService _pdfiumService;
@@ -914,29 +877,19 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             if (w > maxWidth) maxWidth = w;
         }
 
-        foreach (var pageEntry in _pageSizes)
-        {
-            double scale = pageEntry.Value.Width / maxWidth;
-            _displayWidths[pageEntry.Key] = availableWidth * scale;
-        }
-
         lock (_cacheLock)
         {
             foreach (var cacheEntry in _placeHolderCache)
             {
+                double scale = _pageSizes[cacheEntry.Key].Width / maxWidth;
+                cacheEntry.Value.Width = availableWidth * scale;
                 cacheEntry.Value.ContainerWidth = _containerWidth;
-                if (_displayWidths.TryGetValue(cacheEntry.Key, out var w))
-                {
-                    cacheEntry.Value.Width = w;
-                }
             }
             for (var node = _highResCache.First; node != null; node = node.Next)
             {
+                double scale = _pageSizes[node.Value.Key].Width / maxWidth;
+                node.Value.Value.Width = availableWidth * scale;
                 node.Value.Value.ContainerWidth = _containerWidth;
-                if (_displayWidths.TryGetValue(node.Value.Key, out var w))
-                {
-                    node.Value.Value.Width = w;
-                }
             }
         }
 
@@ -1056,8 +1009,8 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         {
             Image = bitmap,
             PageIndex = index,
-            Width = _displayWidths.GetValueOrDefault(index, double.NaN),
-            ContainerWidth = _displayWidths.Count > 0 ? _containerWidth : double.NaN
+            Width = _placeHolderCache.TryGetValue(index, out var ph) ? ph.Width : double.NaN,
+            ContainerWidth = _containerWidth
         };
 
         lock (_cacheLock)
@@ -1105,6 +1058,20 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         if (_pageOrigins.TryGetValue(pageIndex, out var origin))
             return origin;
         return (0, 0);
+    }
+
+    /// <summary>Available width for page display (ScrollView width minus margins).</summary>
+    public double ContainerWidth => _containerWidth;
+
+    /// <summary>
+    /// Returns the placeholder item for <paramref name="index"/> without any
+    /// side effects — no render enqueue, no LRU manipulation.  Safe to call
+    /// from hot paths such as hit‑testing.
+    /// </summary>
+    public PageImageItem? GetPlaceholder(int index)
+    {
+        _placeHolderCache.TryGetValue(index, out var item);
+        return item;
     }
 
     /// <summary>Underlying PDFium service — used by text selection layer.</summary>

@@ -22,7 +22,7 @@ namespace pdf_studio.Services
         // Key: filePath|pageIndex  — simple string key to avoid holding
         // document/page handles across calls.
         private readonly ConcurrentDictionary<string, FpdfTextpageT> _textPageCache = new();
-        private readonly ConcurrentDictionary<string, FpdfDocumentT> _textDocCache = new();
+        private readonly ConcurrentDictionary<string, FpdfDocumentT> _pdfDocumentCache = new();
 
         public PDFiumService()
         {
@@ -333,12 +333,12 @@ namespace pdf_studio.Services
             if (_textPageCache.TryGetValue(pageKey, out var cached))
                 return cached;
 
-            if (!_textDocCache.TryGetValue(docKey, out var document))
+            if (!_pdfDocumentCache.TryGetValue(docKey, out var document))
             {
                 document = fpdfview.FPDF_LoadDocument(filePath, null);
                 if (document == null)
                     throw new Exception($"Failed to open PDF for text: {filePath}");
-                _textDocCache[docKey] = document;
+                _pdfDocumentCache[docKey] = document;
             }
 
             FpdfTextpageT textPage;
@@ -383,11 +383,11 @@ namespace pdf_studio.Services
             }
             _textPageCache.Clear();
 
-            foreach (var kv in _textDocCache)
+            foreach (var kv in _pdfDocumentCache)
             {
                 fpdfview.FPDF_CloseDocument(kv.Value);
             }
-            _textDocCache.Clear();
+            _pdfDocumentCache.Clear();
         }
 
         /// <summary>
