@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel;
 using System.Collections;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -66,11 +67,14 @@ public sealed partial class PdfViewerPage : Page
         PdfScrollViewer.Visibility = Microsoft.UI.Xaml.Visibility.Visible;
     }
 
+    private double _lastAvailableWidth = -1;
+
     private void PdfScrollViewer_SizeChanged(object sender, SizeChangedEventArgs e)
     {
         double availableWidth = e.NewSize.Width - 64; // ItemsRepeater margin (32 * 2)
-        if (availableWidth > 0)
+        if (availableWidth > 0 && Math.Abs(availableWidth - _lastAvailableWidth) > 1.0)
         {
+            _lastAvailableWidth = availableWidth;
             VirtualizingImages.CalculateDisplaySizes(availableWidth);
         }
     }
@@ -210,9 +214,11 @@ public sealed partial class PdfViewerPage : Page
     /// PDF user-space coordinate.
     /// </summary>
     /// <remarks>
-    /// The computation uses only the cached 72‑DPI page dimensions and
-    /// layout geometry — no visual‑tree walk or element realisation is needed,
-    /// so this runs cheaply even on every <c>PointerMoved</c>.
+    /// The computation uses the explicit <see cref="PageImageItem.Height"/>
+    /// values (synchronised with the real bitmap aspect ratio) instead of
+    /// reconstructing the height from 72‑DPI page dimensions.  This keeps the
+    /// manual layout scan from drifting away from the rendered page as the page
+    /// number grows, without walking the visual tree.
     /// </remarks>
     private (PageImageItem? Item, Point? PdfPoint) HitTestPageImage(
         PointerRoutedEventArgs e)
@@ -221,8 +227,12 @@ public sealed partial class PdfViewerPage : Page
         double containerWidth = VirtualizingImages.ContainerWidth;
         if (containerWidth <= 0) return (null, null);
 
+        // ScrollView zoom scales the whole PagesRepeater content, so the pointer
+        // position and all layout metrics must be scaled consistently.
+        double zoom = PdfScrollViewer.ZoomFactor;
         double yCursor = 0;
-        const double spacing = 16;
+        const double baseSpacing = 16;
+        double spacing = baseSpacing * zoom;
 
         for (int i = 0; i < VirtualizingImages.Count; i++)
         {
@@ -234,20 +244,26 @@ public sealed partial class PdfViewerPage : Page
             var (pageW, pageH) = VirtualizingImages.GetPageSizeInPoints(i);
             double dispW = item.Width;
             if (double.IsNaN(dispW) || dispW <= 0) continue;
-            double dispH = dispW * (pageH / pageW);
+
+            // Height is kept in sync with the real displayed height by
+            // CalculateDisplaySizes / FinalizeRender.  Fall back to the page
+            // aspect ratio only during the brief window before placeholders are
+            // initialised.
+            double dispH = item.Height;
+            if (double.IsNaN(dispH) || dispH <= 0)
+                dispH = dispW * (pageH / pageW);
 
             double pageTop = yCursor;
-            double pageBottom = yCursor + dispH;
+            double pageBottom = yCursor + dispH * zoom;
 
             if (repeaterPoint.Y >= pageTop && repeaterPoint.Y < pageBottom)
             {
-                // Found the page.
                 // Image is centred inside the Border (Border.Width == containerWidth).
-                double imageLeft = (containerWidth - dispW) / 2.0;
+                double imageLeft = (containerWidth - dispW) / 2.0 * zoom;
 
-                // Pointer position relative to the Image's display area.
-                double localX = Math.Clamp(repeaterPoint.X - imageLeft, 0, dispW);
-                double localY = Math.Clamp(repeaterPoint.Y - pageTop, 0, dispH);
+                // Convert scaled pointer position back to unscaled image coords.
+                double localX = Math.Clamp((repeaterPoint.X - imageLeft) / zoom, 0, dispW);
+                double localY = Math.Clamp((repeaterPoint.Y - pageTop) / zoom, 0, dispH);
 
                 // Fraction within the page display → PDF user-space.
                 var (originLeft, originBottom) = VirtualizingImages.GetPageOrigin(i);
@@ -257,26 +273,10 @@ public sealed partial class PdfViewerPage : Page
                 return (item, new Point(pdfX, pdfY));
             }
 
-            yCursor += dispH + spacing;
+            yCursor += dispH * zoom + spacing;
         }
 
         return (null, null);
-    }
-
-    /// <summary>Depth-first search for the first <see cref="Image"/> child.</summary>
-    private static Image? FindImageInTree(DependencyObject root)
-    {
-        int count = VisualTreeHelper.GetChildrenCount(root);
-        for (int i = 0; i < count; i++)
-        {
-            var child = VisualTreeHelper.GetChild(root, i);
-            if (child is Image img)
-                return img;
-            var found = FindImageInTree(child);
-            if (found != null)
-                return found;
-        }
-        return null;
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -438,22 +438,40 @@ public sealed partial class PdfViewerPage : Page
         var merged = MergeRectsByLine(rawRects);
         if (merged.Count == 0) return;
 
-        // ── 3. Get Image layout info ─────────────────────────────────
-        var element = PagesRepeater.GetOrCreateElement(pageIndex);
-        var image = FindImageInTree(element);
-        if (image == null) return;
-
-        var transform = image.TransformToVisual(HighlightOverlay);
-        var imageOrigin = transform.TransformPoint(new Point(0, 0));
-
-        if (image.DataContext is not PageImageItem item) return;
+        // ── 3. Get cached layout info ────────────────────────────────
+        var item = VirtualizingImages.GetPlaceholder(pageIndex);
+        if (item == null) return;
         if (item.Image is not { } bitmap) return;
 
-        double imgW = image.ActualWidth;
-        double imgH = image.ActualHeight;
+        double zoom = PdfScrollViewer.ZoomFactor;
+        double imgW = item.Width * zoom;
+        double imgH = item.Height * zoom;
         double bmpW = bitmap.PixelWidth;
         double bmpH = bitmap.PixelHeight;
         if (imgW <= 0 || imgH <= 0 || bmpW <= 0 || bmpH <= 0) return;
+
+        const double baseSpacing = 16;
+        const double repeaterMargin = 32;
+        double spacing = baseSpacing * zoom;
+        double containerWidth = VirtualizingImages.ContainerWidth;
+
+        double yCursor = 0;
+        for (int i = 0; i < pageIndex; i++)
+        {
+            var prev = VirtualizingImages.GetPlaceholder(i);
+            double prevH = prev?.Height ?? 0;
+            if (double.IsNaN(prevH) || prevH <= 0)
+            {
+                var (pw, ph) = VirtualizingImages.GetPageSizeInPoints(i);
+                prevH = item.Width * (ph / pw); // approximate fallback
+            }
+            yCursor += prevH * zoom + spacing;
+        }
+
+        double imageLeft = repeaterMargin * zoom
+                         + Math.Max(0, (containerWidth - item.Width) / 2.0) * zoom;
+        double imageTop = repeaterMargin * zoom + yCursor;
+        var imageOrigin = new Point(imageLeft, imageTop);
 
         double bmpScale = Math.Min(imgW / bmpW, imgH / bmpH);
         double displayedW = bmpW * bmpScale;
@@ -651,16 +669,42 @@ public sealed partial class PdfViewerPage : Page
 //  Data item for ItemsRepeater
 // ════════════════════════════════════════════════════════════════
 
-public class PageImageItem
+public class PageImageItem : INotifyPropertyChanged
 {
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private WriteableBitmap? _image;
+    private double _width = double.NaN;
+    private double _height = double.NaN;
+    private double _containerWidth = double.NaN;
+
     /// <summary>
     /// Rendered page bitmap. <see cref="WriteableBitmap"/> is used directly
     /// as <see cref="Image.Source"/> — no PNG round-trip needed.
     /// </summary>
-    public WriteableBitmap? Image { get; set; }
-    public double Width { get; set; } = double.NaN;
-    public double Height { get; set; } = double.NaN;
-    public double ContainerWidth { get; set; } = double.NaN;
+    public WriteableBitmap? Image
+    {
+        get => _image;
+        set { if (_image != value) { _image = value; PropertyChanged?.Invoke(this, new(nameof(Image))); } }
+    }
+
+    public double Width
+    {
+        get => _width;
+        set { if (_width != value) { _width = value; PropertyChanged?.Invoke(this, new(nameof(Width))); } }
+    }
+
+    public double Height
+    {
+        get => _height;
+        set { if (_height != value) { _height = value; PropertyChanged?.Invoke(this, new(nameof(Height))); } }
+    }
+
+    public double ContainerWidth
+    {
+        get => _containerWidth;
+        set { if (_containerWidth != value) { _containerWidth = value; PropertyChanged?.Invoke(this, new(nameof(ContainerWidth))); } }
+    }
 
     /// <summary>Zero-based page index within the document.</summary>
     public int PageIndex { get; set; }
@@ -882,18 +926,45 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             foreach (var cacheEntry in _placeHolderCache)
             {
                 double scale = _pageSizes[cacheEntry.Key].Width / maxWidth;
-                cacheEntry.Value.Width = availableWidth * scale;
-                cacheEntry.Value.ContainerWidth = _containerWidth;
+                var item = cacheEntry.Value;
+                item.Width = availableWidth * scale;
+                item.ContainerWidth = _containerWidth;
+
+                // Keep Height in sync with the real displayed height so that
+                // HitTestPageImage's manual layout scan stays aligned with the
+                // rendered Image.
+                var bitmap = item.Image;
+                if (bitmap != null)
+                {
+                    item.Height = item.Width * (bitmap.PixelHeight / (double)bitmap.PixelWidth);
+                }
+                else
+                {
+                    var (_, h) = _pageSizes[cacheEntry.Key];
+                    item.Height = item.Width * (h / _pageSizes[cacheEntry.Key].Width);
+                }
             }
             for (var node = _highResCache.First; node != null; node = node.Next)
             {
                 double scale = _pageSizes[node.Value.Key].Width / maxWidth;
-                node.Value.Value.Width = availableWidth * scale;
-                node.Value.Value.ContainerWidth = _containerWidth;
+                var item = node.Value.Value;
+                item.Width = availableWidth * scale;
+                item.ContainerWidth = _containerWidth;
+
+                var bitmap = item.Image;
+                if (bitmap != null)
+                {
+                    item.Height = item.Width * (bitmap.PixelHeight / (double)bitmap.PixelWidth);
+                }
+                else
+                {
+                    var (_, h) = _pageSizes[node.Value.Key];
+                    item.Height = item.Width * (h / _pageSizes[node.Value.Key].Width);
+                }
             }
         }
 
-         OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        // No longer firing Reset — PageImageItem.PropertyChanged handles UI updates.
     }
 
     // ════════════════════════════════════════════════════════════
@@ -1005,11 +1076,19 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         // WriteableBitmap must be created on the UI thread — and we are on it.
         var bitmap = PDFiumService.CreateWriteableBitmapFromRawBuffer(width, height, pixels);
 
+        double placeholderWidth = _placeHolderCache.TryGetValue(index, out var ph) ? ph.Width : double.NaN;
+        double itemHeight = double.NaN;
+        if (!double.IsNaN(placeholderWidth) && placeholderWidth > 0 && width > 0)
+        {
+            itemHeight = placeholderWidth * (height / (double)width);
+        }
+
         var item = new PageImageItem
         {
             Image = bitmap,
             PageIndex = index,
-            Width = _placeHolderCache.TryGetValue(index, out var ph) ? ph.Width : double.NaN,
+            Width = placeholderWidth,
+            Height = itemHeight,
             ContainerWidth = _containerWidth
         };
 
@@ -1088,7 +1167,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     {
         get
         {
-            Debug.WriteLine("Get index {0}", index);
+            //Debug.WriteLine("Get index {0}", index);
             lock (_cacheLock)
             {
                for (var node = _highResCache.First; node != null; node = node.Next)
