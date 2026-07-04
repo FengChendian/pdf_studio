@@ -72,7 +72,7 @@
         <ItemsRepeater
           x:Name="PagesRepeater"
           HorizontalAlignment="Center"
-          Margin="32"
+          Margin="32,0"
           ItemsSource="{x:Bind VirtualizingImages, Mode=OneWay}"
         >
           <ItemsRepeater.Layout>

@@ -35,12 +35,7 @@ public sealed partial class PdfViewerPage : Page
     public ObservableCollection<WriteableBitmap> Images { get; private set; } = [];
     public readonly ImagesVirtualizingCollection VirtualizingImages;
 
-    // Zoom-DPI thresholds
-    private const double ZoomThreshold = 2.0;
-    private const int DefaultRenderDpi = 500;
-    private const int HighRenderDpi = 600;
-    private bool _isHighDpiMode = false;
-    private DispatcherTimer? _zoomDebounceTimer;
+    private DispatcherTimer? _highlightRedrawTimer;
 
     public int RenderedPageCount
     {
@@ -52,6 +47,7 @@ public sealed partial class PdfViewerPage : Page
         FileName = filename;
         VirtualizingImages = new ImagesVirtualizingCollection(FileName);
         InitializeComponent();
+        VirtualizingImages.CollectionChanged += OnVirtualizingImagesCollectionChanged;
         _ = LoadAsync();
     }
 
@@ -76,37 +72,62 @@ public sealed partial class PdfViewerPage : Page
         {
             _lastAvailableWidth = availableWidth;
             VirtualizingImages.CalculateDisplaySizes(availableWidth);
+
+            if (_selectionStartPage >= 0)
+                DrawSelectionHighlights();
         }
     }
 
     private void PdfScrollViewer_ViewChanged(ScrollView sender, object args)
     {
-        return;
-        Debug.WriteLine("PdfScrollViewer_ViewChanged");
-        if (_zoomDebounceTimer == null)
+        // Debounce a redraw of the selection highlights so scrolling/zooming
+        // does not leave stale or missing highlights on newly realized pages.
+        if (_selectionStartPage < 0) return;
+
+        if (_highlightRedrawTimer == null)
         {
-            _zoomDebounceTimer = new DispatcherTimer
+            _highlightRedrawTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromMilliseconds(300)
+                Interval = TimeSpan.FromMilliseconds(100)
             };
-            _zoomDebounceTimer.Tick += OnZoomDebounceTick;
+            _highlightRedrawTimer.Tick += (_, _) =>
+            {
+                _highlightRedrawTimer?.Stop();
+                DrawSelectionHighlights();
+            };
         }
-        _zoomDebounceTimer.Stop();
-        _zoomDebounceTimer.Start();
+
+        _highlightRedrawTimer.Stop();
+        _highlightRedrawTimer.Start();
     }
 
-    private void OnZoomDebounceTick(object? sender, object e)
+    /// <summary>
+    /// Redraws selection highlights when a realized page is replaced (e.g.
+    /// high-res swap) if the page falls inside the current selection.
+    /// </summary>
+    private void OnVirtualizingImagesCollectionChanged(
+        object? sender, NotifyCollectionChangedEventArgs e)
     {
-        _zoomDebounceTimer?.Stop();
+        if (_selectionStartPage < 0 || _selectionEndPage < 0)
+            return;
 
-        bool shouldBeHighDpi = PdfScrollViewer.ZoomFactor >= ZoomThreshold;
-        //Debug.WriteLine($"zoom: {PdfScrollViewer.ZoomFactor}");
-        if (shouldBeHighDpi != _isHighDpiMode)
+        bool needsRedraw = false;
+
+        if (e.Action == NotifyCollectionChangedAction.Replace &&
+            e.NewItems?.Count > 0 &&
+            e.NewItems[0] is PageImageItem item)
         {
-            _isHighDpiMode = shouldBeHighDpi;
-            int newDpi = shouldBeHighDpi ? HighRenderDpi : DefaultRenderDpi;
-            VirtualizingImages.SetRenderDpi(newDpi);
+            int from = Math.Min(_selectionStartPage, _selectionEndPage);
+            int to = Math.Max(_selectionStartPage, _selectionEndPage);
+            needsRedraw = item.PageIndex >= from && item.PageIndex <= to;
         }
+        else if (e.Action == NotifyCollectionChangedAction.Reset)
+        {
+            needsRedraw = true;
+        }
+
+        if (needsRedraw)
+            DrawSelectionHighlights();
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -209,74 +230,145 @@ public sealed partial class PdfViewerPage : Page
     // ════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Hit-tests the pointer against the known page layout and returns the
+    /// Hit-tests the pointer against the realized page images and returns the
     /// matching <see cref="PageImageItem"/> together with the corresponding
     /// PDF user-space coordinate.
     /// </summary>
     /// <remarks>
-    /// The computation uses the explicit <see cref="PageImageItem.Height"/>
-    /// values (synchronised with the real bitmap aspect ratio) instead of
-    /// reconstructing the height from 72‑DPI page dimensions.  This keeps the
-    /// manual layout scan from drifting away from the rendered page as the page
-    /// number grows, without walking the visual tree.
+    /// This method uses the actual visual-tree positions of the page images
+    /// instead of reconstructing the ItemsRepeater layout manually, so it stays
+    /// aligned with the rendered page after zoom, resize, and high-res replacement.
     /// </remarks>
     private (PageImageItem? Item, Point? PdfPoint) HitTestPageImage(
         PointerRoutedEventArgs e)
     {
         var repeaterPoint = e.GetCurrentPoint(PagesRepeater).Position;
-        double containerWidth = VirtualizingImages.ContainerWidth;
-        if (containerWidth <= 0) return (null, null);
-
-        // ScrollView zoom scales the whole PagesRepeater content, so the pointer
-        // position and all layout metrics must be scaled consistently.
-        double zoom = PdfScrollViewer.ZoomFactor;
-        double yCursor = 0;
-        const double baseSpacing = 16;
-        double spacing = baseSpacing * zoom;
 
         for (int i = 0; i < VirtualizingImages.Count; i++)
         {
-            // Use GetPlaceholder (side‑effect‑free) — the indexer triggers
-            // EnqueueRender, which causes unwanted page reloads on every move.
-            var item = VirtualizingImages.GetPlaceholder(i);
-            if (item == null) continue;
+            var image = GetPageImageElement(i);
+            if (image == null)
+                continue;
 
-            var (pageW, pageH) = VirtualizingImages.GetPageSizeInPoints(i);
-            double dispW = item.Width;
-            if (double.IsNaN(dispW) || dispW <= 0) continue;
+            if (image.DataContext is not PageImageItem item)
+                continue;
 
-            // Height is kept in sync with the real displayed height by
-            // CalculateDisplaySizes / FinalizeRender.  Fall back to the page
-            // aspect ratio only during the brief window before placeholders are
-            // initialised.
-            double dispH = item.Height;
-            if (double.IsNaN(dispH) || dispH <= 0)
-                dispH = dispW * (pageH / pageW);
+            if (image.ActualWidth <= 0 || image.ActualHeight <= 0)
+                continue;
 
-            double pageTop = yCursor;
-            double pageBottom = yCursor + dispH * zoom;
+            var bounds = image.TransformToVisual(PagesRepeater)
+                .TransformBounds(new Rect(0, 0, image.ActualWidth, image.ActualHeight));
 
-            if (repeaterPoint.Y >= pageTop && repeaterPoint.Y < pageBottom)
+            if (bounds.Contains(repeaterPoint))
             {
-                // Image is centred inside the Border (Border.Width == containerWidth).
-                double imageLeft = (containerWidth - dispW) / 2.0 * zoom;
-
-                // Convert scaled pointer position back to unscaled image coords.
-                double localX = Math.Clamp((repeaterPoint.X - imageLeft) / zoom, 0, dispW);
-                double localY = Math.Clamp((repeaterPoint.Y - pageTop) / zoom, 0, dispH);
-
-                // Fraction within the page display → PDF user-space.
-                var (originLeft, originBottom) = VirtualizingImages.GetPageOrigin(i);
-                double pdfX = originLeft + (localX / dispW) * pageW;
-                double pdfY = originBottom + pageH - (localY / dispH) * pageH;
-
-                return (item, new Point(pdfX, pdfY));
+                var pdfPoint = MapRepeaterPointToPdf(repeaterPoint, image, item.PageIndex);
+                if (pdfPoint.HasValue)
+                    return (item, pdfPoint.Value);
             }
-
-            yCursor += dispH * zoom + spacing;
         }
 
         return (null, null);
+    }
+
+    /// <summary>
+    /// Returns the realized Image element for a page index, or null if the
+    /// ItemsRepeater has not materialized the container for that page.
+    /// </summary>
+    private Image? GetPageImageElement(int pageIndex)
+    {
+        var element = PagesRepeater.TryGetElement(pageIndex);
+        if (element is Border border && border.Child is Image image)
+            return image;
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns the rectangle (in the Image element's own coordinate space)
+    /// that the bitmap actually occupies when stretched with Stretch=Uniform.
+    /// </summary>
+    private static Rect GetDisplayedBitmapRect(Image image, WriteableBitmap bitmap)
+    {
+        double imgW = image.ActualWidth;
+        double imgH = image.ActualHeight;
+        double bmpW = bitmap.PixelWidth;
+        double bmpH = bitmap.PixelHeight;
+
+        if (imgW <= 0 || imgH <= 0 || bmpW <= 0 || bmpH <= 0)
+            return Rect.Empty;
+
+        double scale = Math.Min(imgW / bmpW, imgH / bmpH);
+        double displayedW = bmpW * scale;
+        double displayedH = bmpH * scale;
+        double offsetX = (imgW - displayedW) / 2.0;
+        double offsetY = (imgH - displayedH) / 2.0;
+
+        return new Rect(offsetX, offsetY, displayedW, displayedH);
+    }
+
+    /// <summary>
+    /// Maps a pointer position expressed in PagesRepeater coordinates to PDF
+    /// user-space coordinates for the page represented by the given Image.
+    /// </summary>
+    private Point? MapRepeaterPointToPdf(Point pointInRepeater, Image image, int pageIndex)
+    {
+        if (image.ActualWidth <= 0 || image.ActualHeight <= 0)
+            return null;
+
+        if (image.Source is not WriteableBitmap bitmap)
+            return null;
+
+        var imageBoundsInRepeater = image.TransformToVisual(PagesRepeater)
+            .TransformBounds(new Rect(0, 0, image.ActualWidth, image.ActualHeight));
+
+        double localX = pointInRepeater.X - imageBoundsInRepeater.X;
+        double localY = pointInRepeater.Y - imageBoundsInRepeater.Y;
+
+        var bitmapRect = GetDisplayedBitmapRect(image, bitmap);
+        if (bitmapRect.IsEmpty)
+            return null;
+
+        localX = Math.Clamp(localX - bitmapRect.X, 0, bitmapRect.Width);
+        localY = Math.Clamp(localY - bitmapRect.Y, 0, bitmapRect.Height);
+
+        var (pageW, pageH) = VirtualizingImages.GetPageSizeInPoints(pageIndex);
+        var (originLeft, originBottom) = VirtualizingImages.GetPageOrigin(pageIndex);
+
+        double pdfX = originLeft + localX * (pageW / bitmapRect.Width);
+        double pdfY = originBottom + pageH - localY * (pageH / bitmapRect.Height);
+
+        return new Point(pdfX, pdfY);
+    }
+
+    /// <summary>
+    /// Maps a single PDF text rectangle to a bounding rectangle on the
+    /// HighlightOverlay Canvas.
+    /// </summary>
+    private Rect MapPdfRectToOverlayRect(
+        (double L, double T, double R, double B) pdfRect,
+        Image image,
+        int pageIndex)
+    {
+        if (image.Source is not WriteableBitmap bitmap)
+            return Rect.Empty;
+
+        var bitmapRect = GetDisplayedBitmapRect(image, bitmap);
+        if (bitmapRect.IsEmpty)
+            return Rect.Empty;
+
+        var (pageW, pageH) = VirtualizingImages.GetPageSizeInPoints(pageIndex);
+        var (originLeft, originBottom) = VirtualizingImages.GetPageOrigin(pageIndex);
+
+        double scaleX = bitmapRect.Width / pageW;
+        double scaleY = bitmapRect.Height / pageH;
+
+        double localX = bitmapRect.X + (pdfRect.L - originLeft) * scaleX;
+        double localY = bitmapRect.Y + (originBottom + pageH - pdfRect.T) * scaleY;
+        double localW = (pdfRect.R - pdfRect.L) * scaleX;
+        double localH = (pdfRect.T - pdfRect.B) * scaleY;
+
+        var transform = image.TransformToVisual(HighlightOverlay);
+        return transform.TransformBounds(new Rect(localX, localY, localW, localH));
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -421,6 +513,9 @@ public sealed partial class PdfViewerPage : Page
     private void DrawPageHighlights(int pageIndex, FpdfTextpageT textPage,
         int startChar, int charCount)
     {
+        var image = GetPageImageElement(pageIndex);
+        if (image == null) return;
+
         // ── 1. Collect raw rects from PDFium (PDF coordinates) ──────
         int rectCount = PDFiumService.TextCountRects(textPage, startChar, charCount);
         if (rectCount <= 0) return;
@@ -438,70 +533,23 @@ public sealed partial class PdfViewerPage : Page
         var merged = MergeRectsByLine(rawRects);
         if (merged.Count == 0) return;
 
-        // ── 3. Get cached layout info ────────────────────────────────
-        var item = VirtualizingImages.GetPlaceholder(pageIndex);
-        if (item == null) return;
-        if (item.Image is not { } bitmap) return;
-
-        double zoom = PdfScrollViewer.ZoomFactor;
-        double imgW = item.Width * zoom;
-        double imgH = item.Height * zoom;
-        double bmpW = bitmap.PixelWidth;
-        double bmpH = bitmap.PixelHeight;
-        if (imgW <= 0 || imgH <= 0 || bmpW <= 0 || bmpH <= 0) return;
-
-        const double baseSpacing = 16;
-        const double repeaterMargin = 32;
-        double spacing = baseSpacing * zoom;
-        double containerWidth = VirtualizingImages.ContainerWidth;
-
-        double yCursor = 0;
-        for (int i = 0; i < pageIndex; i++)
+        // ── 3. Draw merged rects using the actual visual position ────
+        foreach (var rect in merged)
         {
-            var prev = VirtualizingImages.GetPlaceholder(i);
-            double prevH = prev?.Height ?? 0;
-            if (double.IsNaN(prevH) || prevH <= 0)
-            {
-                var (pw, ph) = VirtualizingImages.GetPageSizeInPoints(i);
-                prevH = item.Width * (ph / pw); // approximate fallback
-            }
-            yCursor += prevH * zoom + spacing;
-        }
+            var overlayRect = MapPdfRectToOverlayRect(rect, image, pageIndex);
+            if (overlayRect.IsEmpty || overlayRect.Width <= 0 || overlayRect.Height <= 0)
+                continue;
 
-        double imageLeft = repeaterMargin * zoom
-                         + Math.Max(0, (containerWidth - item.Width) / 2.0) * zoom;
-        double imageTop = repeaterMargin * zoom + yCursor;
-        var imageOrigin = new Point(imageLeft, imageTop);
-
-        double bmpScale = Math.Min(imgW / bmpW, imgH / bmpH);
-        double displayedW = bmpW * bmpScale;
-        double displayedH = bmpH * bmpScale;
-        double offsetX = (imgW - displayedW) / 2;
-        double offsetY = (imgH - displayedH) / 2;
-
-        var (pageW, pageH) = VirtualizingImages.GetPageSizeInPoints(pageIndex);
-        var (originLeft, originBottom) = VirtualizingImages.GetPageOrigin(pageIndex);
-        double scaleX = displayedW / pageW;
-        double scaleY = displayedH / pageH;
-
-        // ── 4. Draw merged rects ─────────────────────────────────────
-        foreach (var (l, t, r, b) in merged)
-        {
-            double winX = imageOrigin.X + offsetX + (l - originLeft) * scaleX;
-            double winY = imageOrigin.Y + offsetY + (originBottom + pageH - t) * scaleY;
-            double winW = (r - l) * scaleX;
-            double winH = (t - b) * scaleY;
-            if (winW <= 0 || winH <= 0) continue;
-
-            var rect = new Rectangle
+            var highlight = new Rectangle
             {
                 Fill = new SolidColorBrush(HighlightColor),
-                Width = winW,
-                Height = winH,
+                Width = overlayRect.Width,
+                Height = overlayRect.Height,
+                IsHitTestVisible = false,
             };
-            Canvas.SetLeft(rect, winX);
-            Canvas.SetTop(rect, winY);
-            HighlightOverlay.Children.Add(rect);
+            Canvas.SetLeft(highlight, overlayRect.X);
+            Canvas.SetTop(highlight, overlayRect.Y);
+            HighlightOverlay.Children.Add(highlight);
         }
     }
 
