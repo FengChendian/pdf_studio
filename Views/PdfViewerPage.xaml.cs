@@ -7,18 +7,24 @@ using System.Collections.Specialized;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Numerics;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Microsoft.Graphics.Canvas.Effects;
+using Microsoft.UI.Composition;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Hosting;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Xaml.Shapes;
+using pdf_studio.Models;
 using pdf_studio.Services;
 using PDFiumCore;
 using Windows.ApplicationModel.DataTransfer;
@@ -47,20 +53,22 @@ public sealed partial class PdfViewerPage : Page
         FileName = filename;
         VirtualizingImages = new ImagesVirtualizingCollection(FileName);
         InitializeComponent();
+        BuildColorPalette();
         VirtualizingImages.CollectionChanged += OnVirtualizingImagesCollectionChanged;
         _ = LoadAsync();
     }
 
     private async Task LoadAsync()
     {
-        FileNameLabel.Text = FileName;
-
         // Render all placeholder images (parallel, scale=1)
         await VirtualizingImages.InitializePlaceholdersAsync();
 
         // Switch visibility
         LoadingOverlay.Visibility = Microsoft.UI.Xaml.Visibility.Collapsed;
         PdfScrollViewer.Visibility = Microsoft.UI.Xaml.Visibility.Visible;
+
+        UpdatePageIndicator();
+        await Task.WhenAll(LoadHighlightsAsync(), LoadTocAsync());
     }
 
     private double _lastAvailableWidth = -1;
@@ -72,28 +80,44 @@ public sealed partial class PdfViewerPage : Page
         {
             _lastAvailableWidth = availableWidth;
             VirtualizingImages.CalculateDisplaySizes(availableWidth);
-
-            if (_selectionStartPage >= 0)
-                DrawSelectionHighlights();
+            UpdatePageIndicator();
+            RedrawAllOverlays();
+            // The repeater applies the new widths via bindings asynchronously —
+            // schedule a second pass so highlights are mapped with settled sizes.
+            ScheduleOverlayRedraw();
         }
     }
 
     private void PdfScrollViewer_ViewChanged(ScrollView sender, object args)
     {
-        // Debounce a redraw of the selection highlights so scrolling/zooming
-        // does not leave stale or missing highlights on newly realized pages.
-        if (_selectionStartPage < 0) return;
+        UpdatePageIndicator();
 
+        // A pending TOC-navigation correction retries here too — the
+        // completed scroll is what makes the repeater realize the target page.
+        if (_pendingCorrectionPage >= 0)
+            ApplyScrollCorrection();
+
+        // Debounce a redraw of the overlays so scrolling does not leave
+        // stale or missing highlights on newly realized pages.
+        ScheduleOverlayRedraw();
+    }
+
+    /// <summary>
+    /// Debounced overlay redraw (50 ms).  Used by scroll/zoom changes and
+    /// by any layout change whose visual-tree updates settle asynchronously.
+    /// </summary>
+    private void ScheduleOverlayRedraw()
+    {
         if (_highlightRedrawTimer == null)
         {
             _highlightRedrawTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromMilliseconds(100)
+                Interval = TimeSpan.FromMilliseconds(50)
             };
             _highlightRedrawTimer.Tick += (_, _) =>
             {
                 _highlightRedrawTimer?.Stop();
-                DrawSelectionHighlights();
+                RedrawAllOverlays();
             };
         }
 
@@ -108,26 +132,288 @@ public sealed partial class PdfViewerPage : Page
     private void OnVirtualizingImagesCollectionChanged(
         object? sender, NotifyCollectionChangedEventArgs e)
     {
-        if (_selectionStartPage < 0 || _selectionEndPage < 0)
+        if (e.Action == NotifyCollectionChangedAction.Reset)
+        {
+            RedrawAllOverlays();
             return;
-
-        bool needsRedraw = false;
+        }
 
         if (e.Action == NotifyCollectionChangedAction.Replace &&
             e.NewItems?.Count > 0 &&
             e.NewItems[0] is PageImageItem item)
         {
-            int from = Math.Min(_selectionStartPage, _selectionEndPage);
-            int to = Math.Max(_selectionStartPage, _selectionEndPage);
-            needsRedraw = item.PageIndex >= from && item.PageIndex <= to;
+            // Redraw when the replaced page is inside the current selection…
+            bool needsRedraw = false;
+            if (_selectionStartPage >= 0 && _selectionEndPage >= 0)
+            {
+                int from = Math.Min(_selectionStartPage, _selectionEndPage);
+                int to = Math.Max(_selectionStartPage, _selectionEndPage);
+                needsRedraw = item.PageIndex >= from && item.PageIndex <= to;
+            }
+
+            // …or when it carries persistent highlights.
+            if (!needsRedraw)
+                needsRedraw = _highlights.Any(h => h.PageIndex == item.PageIndex);
+
+            if (needsRedraw)
+                RedrawAllOverlays();
         }
-        else if (e.Action == NotifyCollectionChangedAction.Reset)
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Toolbar: TOC, highlight pen, page indicator
+    // ════════════════════════════════════════════════════════════════
+
+    private void TocToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        TocSplitView.IsPaneOpen = TocToggle.IsChecked == true;
+    }
+
+    private void TocSplitView_PaneToggled(SplitView sender, object args)
+    {
+        // Pane animation changed the content width; layout/bindings may still
+        // be settling — redraw now and once more shortly after.
+        RedrawAllOverlays();
+        ScheduleOverlayRedraw();
+    }
+
+    private void HighlightPenToggle_Toggled(object sender, RoutedEventArgs e)
+    {
+        _isHighlightMode = HighlightPenToggle.IsChecked == true;
+        ColorPalettePanel.Visibility = _isHighlightMode
+            ? Microsoft.UI.Xaml.Visibility.Visible
+            : Microsoft.UI.Xaml.Visibility.Collapsed;
+        ClearSelection();
+    }
+
+    /// <summary>Highlighter pen colours offered in the toolbar palette.</summary>
+    private static readonly Windows.UI.Color[] PenColors =
+    [
+        Windows.UI.Color.FromArgb(255, 255, 235, 59),  // yellow
+        Windows.UI.Color.FromArgb(255, 105, 240, 174), // green
+        Windows.UI.Color.FromArgb(255, 64, 196, 255),  // blue
+        Windows.UI.Color.FromArgb(255, 255, 64, 129),  // pink
+        Windows.UI.Color.FromArgb(255, 255, 171, 64),  // orange
+    ];
+
+    private Windows.UI.Color _penColor = PenColors[0];
+
+    private void BuildColorPalette()
+    {
+        foreach (var color in PenColors)
         {
-            needsRedraw = true;
+            var swatch = new Microsoft.UI.Xaml.Shapes.Ellipse
+            {
+                Width = 16,
+                Height = 16,
+                Fill = new SolidColorBrush(color),
+            };
+            var button = new Button
+            {
+                Content = swatch,
+                Padding = new Thickness(4),
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(
+                    color == _penColor
+                        ? Windows.UI.Color.FromArgb(255, 0, 120, 215)
+                        : Microsoft.UI.Colors.Transparent),
+                Tag = color,
+            };
+            ToolTipService.SetToolTip(button, "高亮颜色");
+            button.Click += OnPenColorClicked;
+            ColorPalettePanel.Children.Add(button);
+        }
+    }
+
+    private void OnPenColorClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: Windows.UI.Color color })
+        {
+            _penColor = color;
+            foreach (var child in ColorPalettePanel.Children.OfType<Button>())
+            {
+                bool selected = child.Tag is Windows.UI.Color c && c == color;
+                child.BorderBrush = new SolidColorBrush(
+                    selected
+                        ? Windows.UI.Color.FromArgb(255, 0, 120, 215)
+                        : Microsoft.UI.Colors.Transparent);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Page indicator & navigation
+    // ════════════════════════════════════════════════════════════════
+
+    private void UpdatePageIndicator()
+    {
+        int total = VirtualizingImages.Count;
+        if (total == 0)
+        {
+            PageIndicator.Text = "– / –";
+            return;
         }
 
-        if (needsRedraw)
-            DrawSelectionHighlights();
+        // Layout not done yet (page heights all zero) — report page 1.
+        if ((VirtualizingImages.GetPlaceholder(0)?.Height ?? 0) <= 0)
+        {
+            PageIndicator.Text = $"1 / {total}";
+            return;
+        }
+
+        double zoom = PdfScrollViewer.ZoomFactor;
+        double center = (PdfScrollViewer.VerticalOffset + PdfScrollViewer.ViewportHeight / 2) / zoom;
+
+        // Cached offsets are sorted — binary search the page containing the viewport centre.
+        int lo = 0, hi = total - 1, page = 0;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) / 2;
+            if (VirtualizingImages.GetPageTopOffset(mid) <= center)
+            {
+                page = mid;
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+
+        PageIndicator.Text = $"{page + 1} / {total}";
+    }
+
+    // ── TOC scroll correction state ─────────────────────────────────
+    private DispatcherTimer? _scrollCorrectionTimer;
+    private int _pendingCorrectionPage = -1;
+    private int _scrollCorrectionAttempts;
+
+    /// <summary>Scrolls so that the top of <paramref name="pageIndex"/> is visible.</summary>
+    private void ScrollToPage(int pageIndex)
+    {
+        if (pageIndex < 0 || pageIndex >= VirtualizingImages.Count) return;
+
+        double y = VirtualizingImages.GetPageTopOffset(pageIndex);
+
+        double zoom = PdfScrollViewer.ZoomFactor;
+        // Instant jump (standard PDF-reader behaviour)…
+        PdfScrollViewer.ScrollTo(
+            PdfScrollViewer.HorizontalOffset,
+            y * zoom,
+            new ScrollingScrollOptions(
+                ScrollingAnimationMode.Disabled,
+                ScrollingSnapPointsMode.Ignore));
+
+        // …then correct with the target page's measured position once the
+        // ItemsRepeater has realized it (the estimate above can drift a
+        // few DIPs per page due to bitmap aspect rounding).
+        _pendingCorrectionPage = pageIndex;
+        _scrollCorrectionAttempts = 0;
+
+        if (_scrollCorrectionTimer == null)
+        {
+            _scrollCorrectionTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(120)
+            };
+            _scrollCorrectionTimer.Tick += (_, _) => ApplyScrollCorrection();
+        }
+        _scrollCorrectionTimer.Stop();
+        _scrollCorrectionTimer.Start();
+    }
+
+    /// <summary>
+    /// Fine-tunes the scroll offset using the realized page element's
+    /// actual visual position.  Retries a few times while the target page
+    /// is still being materialized by the ItemsRepeater.
+    /// </summary>
+    private void ApplyScrollCorrection()
+    {
+        int pageIndex = _pendingCorrectionPage;
+        if (pageIndex < 0)
+        {
+            _scrollCorrectionTimer?.Stop();
+            return;
+        }
+
+        var image = GetPageImageElement(pageIndex);
+        if (image == null || image.ActualHeight <= 0)
+        {
+            // A far jump keeps the UI thread busy creating large high-res
+            // bitmaps — allow ~1.8 s before giving up on the correction.
+            if (++_scrollCorrectionAttempts >= 15)
+            {
+                _pendingCorrectionPage = -1;
+                _scrollCorrectionTimer?.Stop();
+            }
+            return;
+        }
+
+        var bounds = image.TransformToVisual(ContentGrid)
+            .TransformBounds(new Rect(0, 0, image.ActualWidth, image.ActualHeight));
+
+        double target = bounds.Y * PdfScrollViewer.ZoomFactor;
+        double delta = target - PdfScrollViewer.VerticalOffset;
+        if (Math.Abs(delta) > 0.5)
+        {
+            // The cached offset table is expected to be exact — log any
+            // measured discrepancy so future layout regressions are visible.
+            Debug.WriteLine(
+                $"[Scroll] TOC correction page {pageIndex}: measured delta {delta:F2} DIP " +
+                $"(zoom {PdfScrollViewer.ZoomFactor:F2})");
+
+            PdfScrollViewer.ScrollTo(
+                PdfScrollViewer.HorizontalOffset,
+                target,
+                new ScrollingScrollOptions(
+                    ScrollingAnimationMode.Disabled,
+                    ScrollingSnapPointsMode.Ignore));
+        }
+
+        _pendingCorrectionPage = -1;
+        _scrollCorrectionTimer?.Stop();
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Table of contents
+    // ════════════════════════════════════════════════════════════════
+
+    private async Task LoadTocAsync()
+    {
+        try
+        {
+            var items = await Task.Run(() =>
+                VirtualizingImages.PdfiumService.GetBookmarks(FileName));
+
+            if (items.Count == 0)
+            {
+                TocEmptyLabel.Visibility = Microsoft.UI.Xaml.Visibility.Visible;
+                return;
+            }
+
+            foreach (var item in items)
+                TocTree.RootNodes.Add(BuildTocNode(item));
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[TOC] Failed to load bookmarks: {ex.Message}");
+            TocEmptyLabel.Visibility = Microsoft.UI.Xaml.Visibility.Visible;
+        }
+    }
+
+    private static TreeViewNode BuildTocNode(TocItem item)
+    {
+        var node = new TreeViewNode { Content = item };
+        foreach (var child in item.Children)
+            node.Children.Add(BuildTocNode(child));
+        return node;
+    }
+
+    private void TocTree_ItemInvoked(TreeView sender, TreeViewItemInvokedEventArgs args)
+    {
+        if (args.InvokedItem is TreeViewNode { Content: TocItem item } && item.PageIndex >= 0)
+            ScrollToPage(item.PageIndex);
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -153,12 +439,258 @@ public sealed partial class PdfViewerPage : Page
         Windows.UI.Color.FromArgb(100, 0, 120, 215);
 
     // ════════════════════════════════════════════════════════════════
+    //  Persistent highlights (annotation layer)
+    // ════════════════════════════════════════════════════════════════
+
+    /// <summary>All highlights currently shown, in no particular order.</summary>
+    private readonly List<PdfHighlight> _highlights = [];
+
+    /// <summary>Undo stack: (true = added, false = removed).</summary>
+    private readonly Stack<(bool WasAdded, PdfHighlight Highlight)> _undoStack = new();
+
+    /// <summary>Transient in-drag preview rects (overlay coordinates) shown in pen colour.</summary>
+    private readonly List<Rect> _pendingPreviewRects = [];
+
+    private bool _isHighlightMode;
+
+    /// <summary>Raised when the unsaved-changes state flips (for the tab header asterisk).</summary>
+    public event EventHandler<bool>? DirtyStateChanged;
+
+    private bool _isDirty;
+    private bool IsDirty
+    {
+        get => _isDirty;
+        set
+        {
+            if (_isDirty == value) return;
+            _isDirty = value;
+            DirtyStateChanged?.Invoke(this, value);
+        }
+    }
+
+    private ContainerVisual? _highlightContainerVisual;
+    private readonly Dictionary<Windows.UI.Color, CompositionEffectBrush> _multiplyBrushes = [];
+
+    /// <summary>Redraws both the transient selection overlay and the persistent highlights.</summary>
+    private void RedrawAllOverlays()
+    {
+        DrawSelectionHighlights();
+        RebuildPersistentHighlightVisuals();
+    }
+
+    private void RebuildPersistentHighlightVisuals()
+    {
+        EnsureHighlightVisualHost();
+        if (_highlightContainerVisual == null) return;
+
+        _highlightContainerVisual.Children.RemoveAll();
+
+        // Drag preview (highlight mode only) in the current pen colour.
+        if (_isHighlightMode)
+        {
+            foreach (var rect in _pendingPreviewRects)
+                _highlightContainerVisual.Children.InsertAtTop(
+                    CreateMultiplyVisual(rect, _penColor));
+        }
+
+        foreach (var highlight in _highlights)
+        {
+            var image = GetPageImageElement(highlight.PageIndex);
+            if (image == null) continue;
+
+            foreach (var r in highlight.Rects)
+            {
+                var overlayRect = MapPdfRectToOverlayRect((r.L, r.T, r.R, r.B), image, highlight.PageIndex);
+                if (overlayRect.IsEmpty || overlayRect.Width <= 0 || overlayRect.Height <= 0)
+                    continue;
+
+                _highlightContainerVisual.Children.InsertAtTop(
+                    CreateMultiplyVisual(overlayRect, highlight.Color));
+            }
+        }
+    }
+
+    private void EnsureHighlightVisualHost()
+    {
+        if (_highlightContainerVisual != null) return;
+
+        var compositor = ElementCompositionPreview
+            .GetElementVisual(PersistentHighlightOverlay).Compositor;
+        _highlightContainerVisual = compositor.CreateContainerVisual();
+        ElementCompositionPreview.SetElementChildVisual(
+            PersistentHighlightOverlay, _highlightContainerVisual);
+    }
+
+    /// <summary>
+    /// Creates a SpriteVisual that multiply-blends <paramref name="color"/>
+    /// with whatever is behind it (CompositionBackdropBrush), so black text
+    /// stays black — true highlighter behaviour.
+    /// </summary>
+    private SpriteVisual CreateMultiplyVisual(Rect rect, Windows.UI.Color color)
+    {
+        var compositor = _highlightContainerVisual!.Compositor;
+
+        if (!_multiplyBrushes.TryGetValue(color, out var brush))
+        {
+            var backdrop = new CompositionEffectSourceParameter("backdrop");
+            var blend = new BlendEffect
+            {
+                Background = backdrop,
+                Foreground = new ColorSourceEffect { Color = color },
+                Mode = BlendEffectMode.Multiply,
+            };
+            brush = compositor.CreateEffectFactory(blend).CreateBrush();
+            brush.SetSourceParameter("backdrop", compositor.CreateBackdropBrush());
+            _multiplyBrushes[color] = brush;
+        }
+
+        var visual = compositor.CreateSpriteVisual();
+        visual.Brush = brush;
+        visual.Size = new Vector2((float)rect.Width, (float)rect.Height);
+        visual.Offset = new Vector3((float)rect.X, (float)rect.Y, 0);
+        return visual;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Persistent highlights: load / save / undo
+    // ════════════════════════════════════════════════════════════════
+
+    private async Task LoadHighlightsAsync()
+    {
+        try
+        {
+            var loaded = await Task.Run(() =>
+                VirtualizingImages.PdfiumService.LoadHighlights(FileName));
+            _highlights.AddRange(loaded);
+            RebuildPersistentHighlightVisuals();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[Highlight] Failed to load annotations: {ex.Message}");
+        }
+    }
+
+    private async void OnSaveAccelerator(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+    {
+        args.Handled = true;
+        await SaveHighlightsAsync();
+    }
+
+    private void OnUndoAccelerator(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+    {
+        args.Handled = true;
+        UndoLastHighlightOperation();
+    }
+
+    private void UndoLastHighlightOperation()
+    {
+        if (_undoStack.Count == 0) return;
+
+        var (wasAdded, highlight) = _undoStack.Pop();
+        if (wasAdded)
+            _highlights.Remove(highlight);
+        else
+            _highlights.Add(highlight);
+
+        IsDirty = true;
+        RebuildPersistentHighlightVisuals();
+    }
+
+    private async Task SaveHighlightsAsync()
+    {
+        if (!IsDirty) return;
+
+        string tempPath = FileName + ".highlight-tmp";
+        try
+        {
+            // Release the cached text document handle — overwriting the file
+            // fails while PDFium keeps it open for reading.
+            VirtualizingImages.PdfiumService.ReleaseAllTextPages();
+
+            var snapshot = _highlights.ToList();
+            await Task.Run(() =>
+                VirtualizingImages.PdfiumService.SaveHighlightsToTemp(FileName, snapshot, tempPath));
+
+            await Task.Run(() => ReplaceFileWithRetry(tempPath, FileName));
+
+            IsDirty = false;
+            ShowInfoTip("高亮已保存");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[Highlight] Save failed: {ex}");
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { /* best effort */ }
+
+            var dialog = new ContentDialog
+            {
+                Title = "保存失败",
+                Content = $"无法将高亮保存到文件：\n{ex.Message}",
+                CloseButtonText = "确定",
+                XamlRoot = this.XamlRoot,
+            };
+            await dialog.ShowAsync();
+        }
+    }
+
+    /// <summary>
+    /// Overwrites <paramref name="target"/> with <paramref name="temp"/>,
+    /// retrying briefly while the background render loop may hold a
+    /// transient read handle on the target.
+    /// </summary>
+    private static void ReplaceFileWithRetry(string temp, string target)
+    {
+        const int maxAttempts = 15;
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                File.Copy(temp, target, overwrite: true);
+                File.Delete(temp);
+                return;
+            }
+            catch (IOException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(200);
+            }
+            catch (UnauthorizedAccessException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(200);
+            }
+        }
+    }
+
+    private void ShowInfoTip(string message)
+    {
+        var tip = new TeachingTip
+        {
+            Title = message,
+            PreferredPlacement = TeachingTipPlacementMode.Center,
+            XamlRoot = this.XamlRoot,
+        };
+        tip.IsOpen = true;
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.5) };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            tip.IsOpen = false;
+        };
+        timer.Start();
+    }
+
+    // ════════════════════════════════════════════════════════════════
     //  Pointer event handlers (wired in XAML)
     // ════════════════════════════════════════════════════════════════
 
     private void PdfScrollViewer_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         ClearSelection();
+
+        // Highlight mode: clicking an existing highlight pops a delete flyout.
+        if (_isHighlightMode && TryShowHighlightDeleteFlyout(e))
+        {
+            e.Handled = true;
+            return;
+        }
 
         var (item, pdfPoint) = HitTestPageImage(e);
         if (item == null || pdfPoint == null) return;
@@ -212,10 +744,59 @@ public sealed partial class PdfViewerPage : Page
     {
         if (!_isSelecting) return;
 
-        CopySelectionToClipboard();
+        if (_isHighlightMode)
+            CommitHighlightsFromSelection();
+        else
+            CopySelectionToClipboard();
         // Keep highlights visible until the next PointerPressed clears them.
         _isSelecting = false;
         e.Handled = true;
+    }
+
+    /// <summary>
+    /// In highlight mode, checks whether the pointer press landed on an
+    /// existing persistent highlight; if so shows a delete flyout.
+    /// </summary>
+    private bool TryShowHighlightDeleteFlyout(PointerRoutedEventArgs e)
+    {
+        var (item, pdfPoint) = HitTestPageImage(e);
+        if (item == null || pdfPoint == null) return false;
+
+        double x = pdfPoint.Value.X, y = pdfPoint.Value.Y;
+        var hit = _highlights.FirstOrDefault(h =>
+            h.PageIndex == item.PageIndex &&
+            h.Rects.Any(r => x >= r.L && x <= r.R && y <= r.T && y >= r.B));
+        if (hit == null) return false;
+
+        var flyout = new Flyout();
+        var deleteButton = new Button
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Content = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                Children =
+                {
+                    new FontIcon { Glyph = "", FontSize = 14 }, // Delete
+                    new TextBlock { Text = "删除高亮", VerticalAlignment = VerticalAlignment.Center },
+                },
+            },
+        };
+        deleteButton.Click += (_, _) =>
+        {
+            _highlights.Remove(hit);
+            _undoStack.Push((false, hit));
+            IsDirty = true;
+            RebuildPersistentHighlightVisuals();
+            flyout.Hide();
+        };
+        flyout.Content = deleteButton;
+        flyout.ShowAt(ContentGrid, new FlyoutShowOptions
+        {
+            Position = e.GetCurrentPoint(ContentGrid).Position,
+        });
+        return true;
     }
 
     private void PdfScrollViewer_PointerExited(object sender, PointerRoutedEventArgs e)
@@ -443,16 +1024,19 @@ public sealed partial class PdfViewerPage : Page
     //  Highlight drawing (cross-page)
     // ════════════════════════════════════════════════════════════════
 
-    private void DrawSelectionHighlights()
+    /// <summary>
+    /// Normalizes the current (possibly backwards) selection into a
+    /// page/char range.  Returns false when the selection is empty.
+    /// </summary>
+    private bool TryGetNormalizedSelection(
+        out int pageFrom, out int pageTo, out int charFrom, out int charTo)
     {
-        HighlightOverlay.Children.Clear();
+        pageFrom = pageTo = charFrom = charTo = -1;
 
-        if (_selectionStartPage < 0 || _selectionEndPage < 0) return;
+        if (_selectionStartPage < 0 || _selectionEndPage < 0) return false;
 
-        // Normalise page range.
-        int pageFrom = Math.Min(_selectionStartPage, _selectionEndPage);
-        int pageTo = Math.Max(_selectionStartPage, _selectionEndPage);
-        int charFrom, charTo;
+        pageFrom = Math.Min(_selectionStartPage, _selectionEndPage);
+        pageTo = Math.Max(_selectionStartPage, _selectionEndPage);
 
         if (_selectionStartPage < _selectionEndPage)
         {
@@ -470,45 +1054,73 @@ public sealed partial class PdfViewerPage : Page
             charTo = Math.Max(_selectionStartChar, _selectionEndChar);
         }
 
-        if (charTo <= charFrom && pageFrom == pageTo) return;
+        return charTo > charFrom || pageFrom != pageTo;
+    }
 
-        // Draw highlights for each page in the range.
-        for (int p = pageFrom; p <= pageTo; p++)
+    /// <summary>
+    /// Computes the (startChar, charCount) slice of the normalized
+    /// selection that falls on page <paramref name="p"/>.
+    /// </summary>
+    private static bool TryGetPageCharRange(
+        FpdfTextpageT textPage, int p,
+        int pageFrom, int pageTo, int charFrom, int charTo,
+        out int startChar, out int charCount)
+    {
+        if (p == pageFrom && p == pageTo)
         {
-            var textPage = LoadTextPageForSelection(p);
-            if (textPage == null) continue;
-
-            int startChar, charCount;
-            if (p == pageFrom && p == pageTo)
-            {
-                startChar = charFrom;
-                charCount = charTo - charFrom;
-            }
-            else if (p == pageFrom)
-            {
-                int total = PDFiumService.TextCountChars(textPage);
-                startChar = charFrom;
-                charCount = total - charFrom;
-            }
-            else if (p == pageTo)
-            {
-                startChar = 0;
-                charCount = charTo;
-            }
-            else
-            {
-                startChar = 0;
-                charCount = PDFiumService.TextCountChars(textPage);
-            }
-
-            if (charCount <= 0) continue;
-            DrawPageHighlights(p, textPage, startChar, charCount);
+            startChar = charFrom;
+            charCount = charTo - charFrom;
         }
+        else if (p == pageFrom)
+        {
+            int total = PDFiumService.TextCountChars(textPage);
+            startChar = charFrom;
+            charCount = total - charFrom;
+        }
+        else if (p == pageTo)
+        {
+            startChar = 0;
+            charCount = charTo;
+        }
+        else
+        {
+            startChar = 0;
+            charCount = PDFiumService.TextCountChars(textPage);
+        }
+
+        return charCount > 0;
+    }
+
+    private void DrawSelectionHighlights()
+    {
+        HighlightOverlay.Children.Clear();
+        _pendingPreviewRects.Clear();
+
+        if (TryGetNormalizedSelection(out int pageFrom, out int pageTo,
+                                      out int charFrom, out int charTo))
+        {
+            for (int p = pageFrom; p <= pageTo; p++)
+            {
+                var textPage = LoadTextPageForSelection(p);
+                if (textPage == null) continue;
+
+                if (!TryGetPageCharRange(textPage, p, pageFrom, pageTo,
+                        charFrom, charTo, out int startChar, out int charCount))
+                    continue;
+
+                DrawPageHighlights(p, textPage, startChar, charCount);
+            }
+        }
+
+        // Drag preview rects feed the persistent overlay in highlight mode.
+        RebuildPersistentHighlightVisuals();
     }
 
     /// <summary>
     /// Draws highlight rectangles for a single page on the overlay Canvas.
     /// Merges adjacent text runs on the same line into continuous blocks.
+    /// In highlight mode the rects feed the pen-coloured drag preview
+    /// instead of the blue selection overlay.
     /// </summary>
     private void DrawPageHighlights(int pageIndex, FpdfTextpageT textPage,
         int startChar, int charCount)
@@ -516,29 +1128,20 @@ public sealed partial class PdfViewerPage : Page
         var image = GetPageImageElement(pageIndex);
         if (image == null) return;
 
-        // ── 1. Collect raw rects from PDFium (PDF coordinates) ──────
-        int rectCount = PDFiumService.TextCountRects(textPage, startChar, charCount);
-        if (rectCount <= 0) return;
-
-        var rawRects = new List<(double L, double T, double R, double B)>(rectCount);
-        for (int i = 0; i < rectCount; i++)
-        {
-            if (PDFiumService.TextGetRect(textPage, i,
-                    out double l, out double t, out double r, out double b))
-                rawRects.Add((l, t, r, b));
-        }
-        if (rawRects.Count == 0) return;
-
-        // ── 2. Merge rects that belong to the same visual line ──────
-        var merged = MergeRectsByLine(rawRects);
+        var merged = CollectMergedRects(textPage, startChar, charCount);
         if (merged.Count == 0) return;
 
-        // ── 3. Draw merged rects using the actual visual position ────
         foreach (var rect in merged)
         {
             var overlayRect = MapPdfRectToOverlayRect(rect, image, pageIndex);
             if (overlayRect.IsEmpty || overlayRect.Width <= 0 || overlayRect.Height <= 0)
                 continue;
+
+            if (_isHighlightMode)
+            {
+                _pendingPreviewRects.Add(overlayRect);
+                continue;
+            }
 
             var highlight = new Rectangle
             {
@@ -551,6 +1154,63 @@ public sealed partial class PdfViewerPage : Page
             Canvas.SetTop(highlight, overlayRect.Y);
             HighlightOverlay.Children.Add(highlight);
         }
+    }
+
+    /// <summary>
+    /// Queries PDFium for the raw text rects of a char range and merges
+    /// them into line-level blocks (PDF coordinates).
+    /// </summary>
+    private static List<(double L, double T, double R, double B)> CollectMergedRects(
+        FpdfTextpageT textPage, int startChar, int charCount)
+    {
+        int rectCount = PDFiumService.TextCountRects(textPage, startChar, charCount);
+        if (rectCount <= 0) return [];
+
+        var rawRects = new List<(double L, double T, double R, double B)>(rectCount);
+        for (int i = 0; i < rectCount; i++)
+        {
+            if (PDFiumService.TextGetRect(textPage, i,
+                    out double l, out double t, out double r, out double b))
+                rawRects.Add((l, t, r, b));
+        }
+        if (rawRects.Count == 0) return [];
+
+        return MergeRectsByLine(rawRects);
+    }
+
+    /// <summary>
+    /// Converts the current selection into persistent highlights (one per
+    /// page) using the current pen colour, and pushes undo entries.
+    /// </summary>
+    private void CommitHighlightsFromSelection()
+    {
+        if (!TryGetNormalizedSelection(out int pageFrom, out int pageTo,
+                                       out int charFrom, out int charTo))
+            return;
+
+        for (int p = pageFrom; p <= pageTo; p++)
+        {
+            var textPage = LoadTextPageForSelection(p);
+            if (textPage == null) continue;
+
+            if (!TryGetPageCharRange(textPage, p, pageFrom, pageTo,
+                    charFrom, charTo, out int startChar, out int charCount))
+                continue;
+
+            var merged = CollectMergedRects(textPage, startChar, charCount);
+            if (merged.Count == 0) continue;
+
+            var highlight = new PdfHighlight(
+                p,
+                merged.Select(r => new PdfRect(r.L, r.T, r.R, r.B)).ToList(),
+                _penColor);
+            _highlights.Add(highlight);
+            _undoStack.Push((true, highlight));
+        }
+
+        IsDirty = true;
+        ClearSelection();
+        RebuildPersistentHighlightVisuals();
     }
 
     /// <summary>
@@ -632,6 +1292,11 @@ public sealed partial class PdfViewerPage : Page
         _selectionStartChar = -1;
         _selectionEndChar = -1;
         HighlightOverlay.Children.Clear();
+        if (_pendingPreviewRects.Count > 0)
+        {
+            _pendingPreviewRects.Clear();
+            RebuildPersistentHighlightVisuals();
+        }
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -783,6 +1448,12 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 {
     private readonly Dictionary<int, PageImageItem> _placeHolderCache = [];
     private readonly LinkedList<KeyValuePair<int, PageImageItem>> _highResCache = new();
+    // Weak refs to EVERY high-res item ever created.  Items evicted from the
+    // LRU can still be displayed by realized ItemsRepeater elements — without
+    // tracking them here, CalculateDisplaySizes would leave them at stale
+    // sizes after a width change (e.g. opening the TOC pane), which makes
+    // the page-offset table diverge from the actual layout.
+    private readonly List<WeakReference<PageImageItem>> _allHighResItems = [];
     private readonly object _cacheLock = new();
     private const int MaxHighResCacheSize = 5;
     private volatile int _currentRenderDpi = 400;
@@ -969,6 +1640,17 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             if (w > maxWidth) maxWidth = w;
         }
 
+        // Height always derives from the page's point-space aspect ratio —
+        // NOT from bitmap pixels.  High-res renders round pixel dimensions,
+        // which would otherwise give placeholders and high-res items
+        // slightly different heights and make scroll-offset estimates drift
+        // cumulatively over many pages.
+        double HeightFor(int pageIndex, double width)
+        {
+            var (w, h) = _pageSizes[pageIndex];
+            return width * (h / w);
+        }
+
         lock (_cacheLock)
         {
             foreach (var cacheEntry in _placeHolderCache)
@@ -977,43 +1659,54 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                 var item = cacheEntry.Value;
                 item.Width = availableWidth * scale;
                 item.ContainerWidth = _containerWidth;
-
-                // Keep Height in sync with the real displayed height so that
-                // HitTestPageImage's manual layout scan stays aligned with the
-                // rendered Image.
-                var bitmap = item.Image;
-                if (bitmap != null)
-                {
-                    item.Height = item.Width * (bitmap.PixelHeight / (double)bitmap.PixelWidth);
-                }
-                else
-                {
-                    var (_, h) = _pageSizes[cacheEntry.Key];
-                    item.Height = item.Width * (h / _pageSizes[cacheEntry.Key].Width);
-                }
+                item.Height = HeightFor(cacheEntry.Key, item.Width);
             }
-            for (var node = _highResCache.First; node != null; node = node.Next)
+
+            // Update every live high-res item — including ones already
+            // evicted from the LRU but still displayed by the repeater.
+            for (int i = _allHighResItems.Count - 1; i >= 0; i--)
             {
-                double scale = _pageSizes[node.Value.Key].Width / maxWidth;
-                var item = node.Value.Value;
+                if (!_allHighResItems[i].TryGetTarget(out var item))
+                {
+                    _allHighResItems.RemoveAt(i); // collected — prune
+                    continue;
+                }
+
+                double scale = _pageSizes[item.PageIndex].Width / maxWidth;
                 item.Width = availableWidth * scale;
                 item.ContainerWidth = _containerWidth;
-
-                var bitmap = item.Image;
-                if (bitmap != null)
-                {
-                    item.Height = item.Width * (bitmap.PixelHeight / (double)bitmap.PixelWidth);
-                }
-                else
-                {
-                    var (_, h) = _pageSizes[node.Value.Key];
-                    item.Height = item.Width * (h / _pageSizes[node.Value.Key].Width);
-                }
+                item.Height = HeightFor(item.PageIndex, item.Width);
             }
         }
 
         // No longer firing Reset — PageImageItem.PropertyChanged handles UI updates.
+
+        // Rebuild the cumulative top-offset table (DIP, unzoomed) used by
+        // TOC navigation and the page indicator.  O(n), heights are
+        // deterministic (point-space aspect), so the table is exact.
+        var offsets = new double[_pageCount];
+        double acc = 0;
+        for (int i = 0; i < _pageCount; i++)
+        {
+            offsets[i] = acc;
+            double scale = _pageSizes[i].Width / maxWidth;
+            acc += HeightFor(i, availableWidth * scale) + PageSpacingDips;
+        }
+        _pageTopOffsets = offsets;
     }
+
+    /// <summary>Vertical spacing between pages — must match the ItemsRepeater StackLayout Spacing in XAML.</summary>
+    public const double PageSpacingDips = 16;
+
+    private double[] _pageTopOffsets = [];
+
+    /// <summary>
+    /// Returns the cached unzoomed DIP offset of the top of
+    /// <paramref name="pageIndex"/> within the page stack.  Multiply by the
+    /// current zoom factor to get a ScrollView vertical offset.
+    /// </summary>
+    public double GetPageTopOffset(int pageIndex)
+        => (uint)pageIndex < (uint)_pageTopOffsets.Length ? _pageTopOffsets[pageIndex] : 0;
 
     // ════════════════════════════════════════════════════════════
     //  Dynamic DPI switching
@@ -1126,9 +1819,12 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
         double placeholderWidth = _placeHolderCache.TryGetValue(index, out var ph) ? ph.Width : double.NaN;
         double itemHeight = double.NaN;
-        if (!double.IsNaN(placeholderWidth) && placeholderWidth > 0 && width > 0)
+        if (!double.IsNaN(placeholderWidth) && placeholderWidth > 0 &&
+            _pageSizes.TryGetValue(index, out var pageSize) && pageSize.Width > 0)
         {
-            itemHeight = placeholderWidth * (height / (double)width);
+            // Point-space aspect — consistent with CalculateDisplaySizes so a
+            // high-res swap never changes the displayed page height.
+            itemHeight = placeholderWidth * (pageSize.Height / pageSize.Width);
         }
 
         var item = new PageImageItem
@@ -1149,6 +1845,10 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             {
                 _highResCache.RemoveFirst();
             }
+
+            // Track the item so future width changes still reach it after
+            // LRU eviction (a realized repeater element keeps it alive).
+            _allHighResItems.Add(new WeakReference<PageImageItem>(item));
         }
 
         _placeHolderCache.TryGetValue(index, out var oldValue);

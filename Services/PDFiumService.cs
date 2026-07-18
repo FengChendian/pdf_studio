@@ -1,10 +1,13 @@
 using Microsoft.UI.Xaml.Media.Imaging;
 using mupdf;
 using PDFiumCore;
+using pdf_studio.Models;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Text;
 
@@ -210,6 +213,10 @@ namespace pdf_studio.Services
             lock (_pageLock)
             {
                 page = fpdfview.FPDF_LoadPage(document, pageNumber);
+                // Hide highlight annotations so they never bake into the
+                // rendered bitmap — the viewer draws them itself on an
+                // overlay (single source of truth, no double-draw).
+                HideHighlightAnnotations(page);
             }
             try
             {
@@ -512,6 +519,331 @@ namespace pdf_studio.Services
             {
                 fpdfview.FPDF_CloseDocument(document);
             }
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        //  Annotations (highlight) & bookmarks (TOC)
+        // ════════════════════════════════════════════════════════════════
+
+        private const int FPDF_ANNOT_HIGHLIGHT = 9;
+        private const int FPDF_ANNOT_FLAG_HIDDEN = 1 << 1;
+        private const int PDFACTION_GOTO = 1;
+
+        /// <summary>
+        /// Sets the HIDDEN flag on all highlight annotations of a page so
+        /// PDFium does not render them into the bitmap.  Only affects the
+        /// transient document used for this render call — the file and any
+        /// other document instance are untouched.  Caller must hold
+        /// <see cref="_pageLock"/>.
+        /// </summary>
+        private static void HideHighlightAnnotations(FpdfPageT page)
+        {
+            int count = fpdf_annot.FPDFPageGetAnnotCount(page);
+            for (int i = 0; i < count; i++)
+            {
+                var annot = fpdf_annot.FPDFPageGetAnnot(page, i);
+                if (annot == null) continue;
+                if (fpdf_annot.FPDFAnnotGetSubtype(annot) == FPDF_ANNOT_HIGHLIGHT)
+                    fpdf_annot.FPDFAnnotSetFlags(annot, FPDF_ANNOT_FLAG_HIDDEN);
+                fpdf_annot.FPDFPageCloseAnnot(annot);
+            }
+        }
+
+        // ── Bookmarks (table of contents) ─────────────────────────────
+
+        /// <summary>Loads the document outline as a tree. Empty when the document has no bookmarks.</summary>
+        public List<TocItem> GetBookmarks(string filePath)
+        {
+            var result = new List<TocItem>();
+            var document = fpdfview.FPDF_LoadDocument(filePath, null);
+            if (document == null) return result;
+            try
+            {
+                lock (_pageLock)
+                {
+                    var root = fpdf_doc.FPDFBookmarkGetFirstChild(document, null);
+                    BuildBookmarks(document, root, result);
+                }
+            }
+            finally
+            {
+                fpdfview.FPDF_CloseDocument(document);
+            }
+            return result;
+        }
+
+        private static void BuildBookmarks(
+            FpdfDocumentT document, FpdfBookmarkT first, List<TocItem> list)
+        {
+            var bookmark = first;
+            while (bookmark != null)
+            {
+                var item = new TocItem
+                {
+                    Title = GetBookmarkTitle(bookmark),
+                    PageIndex = GetBookmarkPageIndex(document, bookmark),
+                };
+                list.Add(item);
+
+                var child = fpdf_doc.FPDFBookmarkGetFirstChild(document, bookmark);
+                if (child != null)
+                    BuildBookmarks(document, child, item.Children);
+
+                bookmark = fpdf_doc.FPDFBookmarkGetNextSibling(document, bookmark);
+            }
+        }
+
+        private static string GetBookmarkTitle(FpdfBookmarkT bookmark)
+        {
+            ulong len = fpdf_doc.FPDFBookmarkGetTitle(bookmark, IntPtr.Zero, 0);
+            if (len <= 2) return string.Empty;
+
+            var buffer = Marshal.AllocHGlobal((int)len);
+            try
+            {
+                fpdf_doc.FPDFBookmarkGetTitle(bookmark, buffer, len);
+                // UTF-16LE, includes null terminator.
+                return Marshal.PtrToStringUni(buffer, (int)len / 2 - 1) ?? string.Empty;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static int GetBookmarkPageIndex(FpdfDocumentT document, FpdfBookmarkT bookmark)
+        {
+            var dest = fpdf_doc.FPDFBookmarkGetDest(document, bookmark);
+            if (dest == null)
+            {
+                var action = fpdf_doc.FPDFBookmarkGetAction(bookmark);
+                if (action != null && fpdf_doc.FPDFActionGetType(action) == PDFACTION_GOTO)
+                    dest = fpdf_doc.FPDFActionGetDest(document, action);
+            }
+            return dest != null ? fpdf_doc.FPDFDestGetDestPageIndex(document, dest) : -1;
+        }
+
+        // ── Highlight annotations: load ───────────────────────────────
+
+        /// <summary>Loads all highlight annotations from the document.</summary>
+        public List<PdfHighlight> LoadHighlights(string filePath)
+        {
+            var result = new List<PdfHighlight>();
+            var document = fpdfview.FPDF_LoadDocument(filePath, null);
+            if (document == null) return result;
+            try
+            {
+                int pageCount = fpdfview.FPDF_GetPageCount(document);
+                for (int p = 0; p < pageCount; p++)
+                {
+                    FpdfPageT page;
+                    lock (_pageLock)
+                    {
+                        page = fpdfview.FPDF_LoadPage(document, p);
+                    }
+                    if (page == null) continue;
+                    try
+                    {
+                        lock (_pageLock)
+                        {
+                            int annotCount = fpdf_annot.FPDFPageGetAnnotCount(page);
+                            for (int i = 0; i < annotCount; i++)
+                            {
+                                var annot = fpdf_annot.FPDFPageGetAnnot(page, i);
+                                if (annot == null) continue;
+                                try
+                                {
+                                    if (fpdf_annot.FPDFAnnotGetSubtype(annot) != FPDF_ANNOT_HIGHLIGHT)
+                                        continue;
+
+                                    uint r = 0, g = 0, b = 0, a = 0;
+                                    fpdf_annot.FPDFAnnotGetColor(annot,
+                                        FPDFANNOT_COLORTYPE.FPDFANNOT_COLORTYPE_Color,
+                                        ref r, ref g, ref b, ref a);
+
+                                    var rects = new List<PdfRect>();
+                                    ulong quadCount = fpdf_annot.FPDFAnnotCountAttachmentPoints(annot);
+                                    for (ulong q = 0; q < quadCount; q++)
+                                    {
+                                        using var quad = new FS_QUADPOINTSF();
+                                        if (fpdf_annot.FPDFAnnotGetAttachmentPoints(annot, q, quad) != 0)
+                                            rects.Add(QuadToRect(quad));
+                                    }
+
+                                    if (rects.Count > 0)
+                                    {
+                                        result.Add(new PdfHighlight(p, rects,
+                                            Windows.UI.Color.FromArgb(255, (byte)r, (byte)g, (byte)b)));
+                                    }
+                                }
+                                finally
+                                {
+                                    fpdf_annot.FPDFPageCloseAnnot(annot);
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        lock (_pageLock)
+                        {
+                            fpdfview.FPDF_ClosePage(page);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                fpdfview.FPDF_CloseDocument(document);
+            }
+            return result;
+        }
+
+        private static PdfRect QuadToRect(FS_QUADPOINTSF quad)
+        {
+            // QuadPoints order (per PDF spec): top-left, top-right, bottom-left, bottom-right.
+            double left = Math.Min(quad.X1, quad.X3);
+            double right = Math.Max(quad.X2, quad.X4);
+            double top = Math.Max(quad.Y1, quad.Y2);
+            double bottom = Math.Min(quad.Y3, quad.Y4);
+            return new PdfRect(left, top, right, bottom);
+        }
+
+        // ── Highlight annotations: save ───────────────────────────────
+
+        /// <summary>
+        /// Rewrites all highlight annotations in the document from
+        /// <paramref name="highlights"/> (non-highlight annotations are
+        /// preserved) and saves a full copy to <paramref name="tempPath"/>.
+        /// The caller is responsible for atomically replacing the original
+        /// file with the temp file.  Thread-safe (guarded by _pageLock).
+        /// </summary>
+        public void SaveHighlightsToTemp(
+            string filePath, IReadOnlyList<PdfHighlight> highlights, string tempPath)
+        {
+            var document = fpdfview.FPDF_LoadDocument(filePath, null);
+            if (document == null)
+                throw new InvalidOperationException($"无法打开 PDF 文档: {filePath}");
+            try
+            {
+                var byPage = highlights
+                    .GroupBy(h => h.PageIndex)
+                    .ToDictionary(g => g.Key, g => (IReadOnlyList<PdfHighlight>)g.ToList());
+
+                int pageCount = fpdfview.FPDF_GetPageCount(document);
+                for (int p = 0; p < pageCount; p++)
+                {
+                    byPage.TryGetValue(p, out var pageHighlights);
+
+                    FpdfPageT page;
+                    lock (_pageLock)
+                    {
+                        page = fpdfview.FPDF_LoadPage(document, p);
+                    }
+                    if (page == null) continue;
+                    try
+                    {
+                        lock (_pageLock)
+                        {
+                            // Remove existing highlight annotations (iterate backwards).
+                            for (int i = fpdf_annot.FPDFPageGetAnnotCount(page) - 1; i >= 0; i--)
+                            {
+                                var annot = fpdf_annot.FPDFPageGetAnnot(page, i);
+                                if (annot == null) continue;
+                                int subtype = fpdf_annot.FPDFAnnotGetSubtype(annot);
+                                fpdf_annot.FPDFPageCloseAnnot(annot);
+                                if (subtype == FPDF_ANNOT_HIGHLIGHT)
+                                    fpdf_annot.FPDFPageRemoveAnnot(page, i);
+                            }
+
+                            // Recreate from the in-memory model.
+                            if (pageHighlights != null)
+                            {
+                                foreach (var highlight in pageHighlights)
+                                    AppendHighlightAnnot(page, highlight);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        lock (_pageLock)
+                        {
+                            fpdfview.FPDF_ClosePage(page);
+                        }
+                    }
+                }
+
+                SaveDocumentAsCopy(document, tempPath);
+            }
+            finally
+            {
+                fpdfview.FPDF_CloseDocument(document);
+            }
+        }
+
+        private static void AppendHighlightAnnot(FpdfPageT page, PdfHighlight highlight)
+        {
+            var annot = fpdf_annot.FPDFPageCreateAnnot(page, FPDF_ANNOT_HIGHLIGHT);
+            if (annot == null) return;
+            try
+            {
+                fpdf_annot.FPDFAnnotSetColor(annot,
+                    FPDFANNOT_COLORTYPE.FPDFANNOT_COLORTYPE_Color,
+                    highlight.Color.R, highlight.Color.G, highlight.Color.B, 255);
+
+                double left = highlight.Rects.Min(r => r.L);
+                double right = highlight.Rects.Max(r => r.R);
+                double top = highlight.Rects.Max(r => r.T);
+                double bottom = highlight.Rects.Min(r => r.B);
+
+                using var rect = new FS_RECTF_
+                {
+                    Left = (float)left,
+                    Top = (float)top,
+                    Right = (float)right,
+                    Bottom = (float)bottom,
+                };
+                fpdf_annot.FPDFAnnotSetRect(annot, rect);
+
+                foreach (var r in highlight.Rects)
+                {
+                    using var quad = new FS_QUADPOINTSF
+                    {
+                        X1 = (float)r.L, Y1 = (float)r.T, // top-left
+                        X2 = (float)r.R, Y2 = (float)r.T, // top-right
+                        X3 = (float)r.L, Y3 = (float)r.B, // bottom-left
+                        X4 = (float)r.R, Y4 = (float)r.B, // bottom-right
+                    };
+                    fpdf_annot.FPDFAnnotAppendAttachmentPoints(annot, quad);
+                }
+            }
+            finally
+            {
+                fpdf_annot.FPDFPageCloseAnnot(annot);
+            }
+        }
+
+        private static void SaveDocumentAsCopy(FpdfDocumentT document, string tempPath)
+        {
+            using var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None);
+            using var fileWrite = new FPDF_FILEWRITE_();
+
+            fileWrite.WriteBlock = (pThis, pData, size) =>
+            {
+                int length = (int)size;
+                var bytes = new byte[length];
+                Marshal.Copy(pData, bytes, 0, length);
+                stream.Write(bytes, 0, length);
+                return 1;
+            };
+
+            int ok;
+            lock (_pageLock)
+            {
+                ok = fpdf_save.FPDF_SaveAsCopy(document, fileWrite, 0);
+            }
+            if (ok == 0)
+                throw new InvalidOperationException("FPDF_SaveAsCopy 保存失败");
         }
 
         // ════════════════════════════════════════════════════════════════

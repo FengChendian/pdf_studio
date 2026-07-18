@@ -129,6 +129,12 @@ public sealed partial class MainWindow : Window
             },
         };
 
+        // Mark the tab with an asterisk while there are unsaved highlights.
+        pdfPage.DirtyStateChanged += (_, dirty) =>
+        {
+            tabItem.Header = dirty ? fileName + " *" : fileName;
+        };
+
         MainTabView.TabItems.Add(tabItem);
         MainTabView.SelectedItem = tabItem;
     }

@@ -11,92 +11,181 @@
       <RowDefinition Height="*" />
     </Grid.RowDefinitions>
 
-    <!-- Toolbar -->
+    <Grid.KeyboardAccelerators>
+      <KeyboardAccelerator Key="S" Modifiers="Control" Invoked="OnSaveAccelerator" />
+      <KeyboardAccelerator Key="Z" Modifiers="Control" Invoked="OnUndoAccelerator" />
+    </Grid.KeyboardAccelerators>
+
+    <!-- ══ Toolbar: [TOC] | [highlight pen + colors] | [page x / y] ══ -->
     <Border
       Grid.Row="0"
       Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
       BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
       BorderThickness="0,0,0,1"
-      Padding="12,8"
-      Height="Auto"
-    >
-      <TextBlock
-        x:Name="FileNameLabel"
-        Text="PDF Document"
-        FontSize="14"
-        VerticalAlignment="Center"
-        TextTrimming="CharacterEllipsis"
-      />
-    </Border>
-
-    <!-- Loading overlay -->
-    <Border
-      Grid.Row="1"
-      x:Name="LoadingOverlay"
-      Background="Transparent"
-      VerticalAlignment="Stretch"
-      Height="Auto"
-    >
-      <ProgressRing
-        x:Name="LoadingIndicator"
-        IsActive="True"
-        Width="40"
-        Height="40"
-        HorizontalAlignment="Center"
-        VerticalAlignment="Center"
-      />
-    </Border>
-
-    <!-- PDF Content -->
-    <ScrollView
-      Grid.Row="1"
-      x:Name="PdfScrollViewer"
-      Visibility="Collapsed"
-      ZoomMode="Enabled"
-      MinZoomFactor="0.25"
-      MaxZoomFactor="4.0"
-      HorizontalScrollMode="Auto"
-      VerticalScrollMode="Auto"
-      HorizontalScrollBarVisibility="Auto"
-      VerticalScrollBarVisibility="Auto"
-      HorizontalAlignment="Stretch"
-      Height="Auto"
-      ViewChanged="PdfScrollViewer_ViewChanged"
-      SizeChanged="PdfScrollViewer_SizeChanged"
-      PointerPressed="PdfScrollViewer_PointerPressed"
-      PointerMoved="PdfScrollViewer_PointerMoved"
-      PointerReleased="PdfScrollViewer_PointerReleased"
-      PointerExited="PdfScrollViewer_PointerExited"
+      Padding="8,4"
     >
       <Grid>
-        <ItemsRepeater
-          x:Name="PagesRepeater"
-          HorizontalAlignment="Center"
-          Margin="32,0"
-          ItemsSource="{x:Bind VirtualizingImages, Mode=OneWay}"
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+
+        <!-- Left: table of contents -->
+        <ToggleButton
+          x:Name="TocToggle"
+          Grid.Column="0"
+          Checked="TocToggle_Toggled"
+          Unchecked="TocToggle_Toggled"
+          ToolTipService.ToolTip="目录"
         >
-          <ItemsRepeater.Layout>
-            <StackLayout Orientation="Vertical" Spacing="16" />
-          </ItemsRepeater.Layout>
+          <FontIcon Glyph="&#xE8A4;" FontSize="16" />
+        </ToggleButton>
 
-          <ItemsRepeater.ItemTemplate>
-            <DataTemplate>
-              <Border Width="{Binding ContainerWidth}">
-                <Image Source="{Binding Image}" Width="{Binding Width}" Height="{Binding Height}" Stretch="Uniform" HorizontalAlignment="Center" />
-              </Border>
-            </DataTemplate>
-          </ItemsRepeater.ItemTemplate>
-        </ItemsRepeater>
+        <!-- Center: highlight pen + color palette -->
+        <StackPanel
+          Grid.Column="1"
+          Orientation="Horizontal"
+          HorizontalAlignment="Center"
+          Spacing="8"
+        >
+          <ToggleButton
+            x:Name="HighlightPenToggle"
+            Checked="HighlightPenToggle_Toggled"
+            Unchecked="HighlightPenToggle_Toggled"
+            ToolTipService.ToolTip="高亮笔"
+          >
+            <FontIcon Glyph="&#xE76D;" FontSize="16" />
+          </ToggleButton>
 
-        <!-- Text-selection highlight overlay — drawn on top of all pages.
-             IsHitTestVisible="False" so pointer events pass through to ScrollView. -->
-        <Canvas
-          x:Name="HighlightOverlay"
-          IsHitTestVisible="False"
-          HorizontalAlignment="Stretch"
-          VerticalAlignment="Stretch"
+          <StackPanel
+            x:Name="ColorPalettePanel"
+            Orientation="Horizontal"
+            Spacing="6"
+            VerticalAlignment="Center"
+            Visibility="Collapsed"
+          />
+        </StackPanel>
+
+        <!-- Right: page indicator -->
+        <TextBlock
+          x:Name="PageIndicator"
+          Grid.Column="2"
+          VerticalAlignment="Center"
+          FontSize="13"
+          Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+          Text="– / –"
         />
       </Grid>
-    </ScrollView>
+    </Border>
+
+    <!-- ══ Content: TOC pane + PDF pages ══ -->
+    <SplitView
+      Grid.Row="1"
+      x:Name="TocSplitView"
+      DisplayMode="Inline"
+      IsPaneOpen="False"
+      OpenPaneLength="300"
+      PanePlacement="Left"
+      PaneOpened="TocSplitView_PaneToggled"
+      PaneClosed="TocSplitView_PaneToggled"
+    >
+      <SplitView.Pane>
+        <Grid Background="{ThemeResource LayerFillColorDefaultBrush}">
+          <TreeView
+            x:Name="TocTree"
+            x:FieldModifier="public"
+            ItemInvoked="TocTree_ItemInvoked"
+            SelectionMode="None"
+            Padding="0,8"
+          />
+          <TextBlock
+            x:Name="TocEmptyLabel"
+            Text="本文档没有目录"
+            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center"
+            Visibility="Collapsed"
+          />
+        </Grid>
+      </SplitView.Pane>
+
+      <SplitView.Content>
+        <Grid>
+          <!-- Loading overlay -->
+          <Border x:Name="LoadingOverlay" Background="Transparent">
+            <ProgressRing
+              x:Name="LoadingIndicator"
+              IsActive="True"
+              Width="40"
+              Height="40"
+              HorizontalAlignment="Center"
+              VerticalAlignment="Center"
+            />
+          </Border>
+
+          <!-- PDF Content -->
+          <ScrollView
+            x:Name="PdfScrollViewer"
+            Visibility="Collapsed"
+            ZoomMode="Enabled"
+            MinZoomFactor="0.25"
+            MaxZoomFactor="4.0"
+            HorizontalScrollMode="Auto"
+            VerticalScrollMode="Auto"
+            HorizontalScrollBarVisibility="Auto"
+            VerticalScrollBarVisibility="Auto"
+            HorizontalAlignment="Stretch"
+            ViewChanged="PdfScrollViewer_ViewChanged"
+            SizeChanged="PdfScrollViewer_SizeChanged"
+            PointerPressed="PdfScrollViewer_PointerPressed"
+            PointerMoved="PdfScrollViewer_PointerMoved"
+            PointerReleased="PdfScrollViewer_PointerReleased"
+            PointerExited="PdfScrollViewer_PointerExited"
+          >
+            <Grid x:Name="ContentGrid">
+              <ItemsRepeater
+                x:Name="PagesRepeater"
+                HorizontalAlignment="Center"
+                Margin="32,0"
+                ItemsSource="{x:Bind VirtualizingImages, Mode=OneWay}"
+              >
+                <ItemsRepeater.Layout>
+                  <StackLayout Orientation="Vertical" Spacing="16" />
+                </ItemsRepeater.Layout>
+
+                <ItemsRepeater.ItemTemplate>
+                  <DataTemplate>
+                    <Border Width="{Binding ContainerWidth}">
+                      <Image Source="{Binding Image}" Width="{Binding Width}" Height="{Binding Height}" Stretch="Uniform" HorizontalAlignment="Center" />
+                    </Border>
+                  </DataTemplate>
+                </ItemsRepeater.ItemTemplate>
+              </ItemsRepeater>
+
+              <!-- Persistent highlight overlay. Hosts composition SpriteVisuals
+                   with a Win2D Multiply BlendEffect against a backdrop brush,
+                   so black text stays black. IsHitTestVisible="False" so pointer
+                   events pass through to ScrollView. -->
+              <Canvas
+                x:Name="PersistentHighlightOverlay"
+                IsHitTestVisible="False"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch"
+              />
+
+              <!-- Text-selection highlight overlay — drawn on top of all pages.
+                   IsHitTestVisible="False" so pointer events pass through to ScrollView. -->
+              <Canvas
+                x:Name="HighlightOverlay"
+                IsHitTestVisible="False"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch"
+              />
+            </Grid>
+          </ScrollView>
+        </Grid>
+      </SplitView.Content>
+    </SplitView>
   </Grid>
 </Page>
