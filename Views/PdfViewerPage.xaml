@@ -3,17 +3,52 @@
   x:Class="pdf_studio.Views.PdfViewerPage"
   xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
   xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-  xmlns:local="using:pdf_studio.Views"
->
+  xmlns:local="using:pdf_studio.Views">
+  <Page.Resources>
+    <!-- ListViewItem chrome stripped to a plain presenter: no selection
+         visuals, no padding, no min-size.  The 16 DIP bottom margin is the
+         inter-page spacing — it must match PageSpacingDips in code-behind. -->
+    <Style x:Key="PageItemContainerStyle"
+        TargetType="ListViewItem">
+      <Setter Property="Padding"
+          Value="0"/>
+      <Setter Property="Margin"
+          Value="0,0,0,16"/>
+      <Setter Property="MinWidth"
+          Value="0"/>
+      <Setter Property="MinHeight"
+          Value="0"/>
+      <Setter Property="HorizontalContentAlignment"
+          Value="Stretch"/>
+      <Setter Property="VerticalContentAlignment"
+          Value="Stretch"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListViewItem">
+            <ContentPresenter
+              HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+              Content="{TemplateBinding Content}"
+              ContentTemplate="{TemplateBinding ContentTemplate}"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Page.Resources>
+
   <Grid>
     <Grid.RowDefinitions>
-      <RowDefinition Height="40" />
-      <RowDefinition Height="*" />
+      <RowDefinition Height="40"/>
+      <RowDefinition Height="*"/>
     </Grid.RowDefinitions>
 
     <Grid.KeyboardAccelerators>
-      <KeyboardAccelerator Key="S" Modifiers="Control" Invoked="OnSaveAccelerator" />
-      <KeyboardAccelerator Key="Z" Modifiers="Control" Invoked="OnUndoAccelerator" />
+      <KeyboardAccelerator Key="S"
+          Modifiers="Control"
+          Invoked="OnSaveAccelerator"/>
+      <KeyboardAccelerator Key="Z"
+          Modifiers="Control"
+          Invoked="OnUndoAccelerator"/>
     </Grid.KeyboardAccelerators>
 
     <!-- ══ Toolbar: [TOC] | [highlight pen + colors] | [page x / y] ══ -->
@@ -22,13 +57,12 @@
       Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
       BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
       BorderThickness="0,0,0,1"
-      Padding="8,4"
-    >
+      Padding="8,4">
       <Grid>
         <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="Auto" />
-          <ColumnDefinition Width="*" />
-          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
 
         <!-- Left: table of contents -->
@@ -37,9 +71,9 @@
           Grid.Column="0"
           Checked="TocToggle_Toggled"
           Unchecked="TocToggle_Toggled"
-          ToolTipService.ToolTip="目录"
-        >
-          <FontIcon Glyph="&#xE8A4;" FontSize="16" />
+          ToolTipService.ToolTip="目录">
+          <FontIcon Glyph="&#xE8A4;"
+              FontSize="16"/>
         </ToggleButton>
 
         <!-- Center: highlight pen + color palette -->
@@ -47,15 +81,14 @@
           Grid.Column="1"
           Orientation="Horizontal"
           HorizontalAlignment="Center"
-          Spacing="8"
-        >
+          Spacing="8">
           <ToggleButton
             x:Name="HighlightPenToggle"
             Checked="HighlightPenToggle_Toggled"
             Unchecked="HighlightPenToggle_Toggled"
-            ToolTipService.ToolTip="高亮笔"
-          >
-            <FontIcon Glyph="&#xE76D;" FontSize="16" />
+            ToolTipService.ToolTip="高亮笔">
+            <FontIcon Glyph="&#xE76D;"
+                FontSize="16"/>
           </ToggleButton>
 
           <StackPanel
@@ -63,8 +96,7 @@
             Orientation="Horizontal"
             Spacing="6"
             VerticalAlignment="Center"
-            Visibility="Collapsed"
-          />
+            Visibility="Collapsed"/>
         </StackPanel>
 
         <!-- Right: page indicator -->
@@ -74,8 +106,7 @@
           VerticalAlignment="Center"
           FontSize="13"
           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-          Text="– / –"
-        />
+          Text="– / –"/>
       </Grid>
     </Border>
 
@@ -83,13 +114,12 @@
     <SplitView
       Grid.Row="1"
       x:Name="TocSplitView"
-      DisplayMode="Inline"
+      DisplayMode="Overlay"
       IsPaneOpen="False"
       OpenPaneLength="300"
       PanePlacement="Left"
       PaneOpened="TocSplitView_PaneToggled"
-      PaneClosed="TocSplitView_PaneToggled"
-    >
+      PaneClosed="TocSplitView_PaneToggled">
       <SplitView.Pane>
         <Grid Background="{ThemeResource LayerFillColorDefaultBrush}">
           <TreeView
@@ -97,31 +127,29 @@
             x:FieldModifier="public"
             ItemInvoked="TocTree_ItemInvoked"
             SelectionMode="None"
-            Padding="0,8"
-          />
+            Padding="0,8"/>
           <TextBlock
             x:Name="TocEmptyLabel"
             Text="本文档没有目录"
             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
             HorizontalAlignment="Center"
             VerticalAlignment="Center"
-            Visibility="Collapsed"
-          />
+            Visibility="Collapsed"/>
         </Grid>
       </SplitView.Pane>
 
       <SplitView.Content>
         <Grid>
           <!-- Loading overlay -->
-          <Border x:Name="LoadingOverlay" Background="Transparent">
+          <Border x:Name="LoadingOverlay"
+              Background="Transparent">
             <ProgressRing
               x:Name="LoadingIndicator"
               IsActive="True"
               Width="40"
               Height="40"
               HorizontalAlignment="Center"
-              VerticalAlignment="Center"
-            />
+              VerticalAlignment="Center"/>
           </Border>
 
           <!-- PDF Content -->
@@ -137,31 +165,49 @@
             VerticalScrollBarVisibility="Auto"
             HorizontalAlignment="Stretch"
             ViewChanged="PdfScrollViewer_ViewChanged"
-            SizeChanged="PdfScrollViewer_SizeChanged"
-            PointerPressed="PdfScrollViewer_PointerPressed"
-            PointerMoved="PdfScrollViewer_PointerMoved"
-            PointerReleased="PdfScrollViewer_PointerReleased"
-            PointerExited="PdfScrollViewer_PointerExited"
-          >
+            SizeChanged="PdfScrollViewer_SizeChanged">
             <Grid x:Name="ContentGrid">
-              <ItemsRepeater
-                x:Name="PagesRepeater"
-                HorizontalAlignment="Center"
+              <!-- Page list.  Its own scrolling is disabled — it lives inside
+                   the outer ScrollView, which therefore hands it an effectively
+                   infinite viewport: every container is realized up front and
+                   the extent is exact (no average-size estimation).  High-res
+                   rendering is driven from ScrollView.ViewChanged instead of
+                   element realization (see EnsureVisiblePagesHighRes). -->
+              <ListView
+                x:Name="PagesList"
                 Margin="32,0"
+                Padding="0"
+                HorizontalAlignment="Center"
+                Background="Transparent"
+                BorderThickness="0"
+                IsItemClickEnabled="False"
+                IsTabStop="False"
+                ItemContainerStyle="{StaticResource PageItemContainerStyle}"
                 ItemsSource="{x:Bind VirtualizingImages, Mode=OneWay}"
-              >
-                <ItemsRepeater.Layout>
-                  <StackLayout Orientation="Vertical" Spacing="16" />
-                </ItemsRepeater.Layout>
+                ScrollViewer.HorizontalScrollBarVisibility="Hidden"
+                ScrollViewer.HorizontalScrollMode="Disabled"
+                ScrollViewer.VerticalScrollBarVisibility="Hidden"
+                ScrollViewer.VerticalScrollMode="Disabled"
+                ScrollViewer.ZoomMode="Disabled"
+                SelectionMode="None">
+                <!-- No entrance/content transitions — a high-res bitmap swap
+                     must replace the placeholder instantly, not fade in. -->
+                <ListView.ItemContainerTransitions>
+                  <ContentThemeTransition/>
+                </ListView.ItemContainerTransitions>
 
-                <ItemsRepeater.ItemTemplate>
+                <ListView.ItemTemplate>
                   <DataTemplate>
                     <Border Width="{Binding ContainerWidth}">
-                      <Image Source="{Binding Image}" Width="{Binding Width}" Height="{Binding Height}" Stretch="Uniform" HorizontalAlignment="Center" />
+                      <Image Source="{Binding Image}"
+                          Width="{Binding Width}"
+                          Height="{Binding Height}"
+                          Stretch="Uniform"
+                          HorizontalAlignment="Center"/>
                     </Border>
                   </DataTemplate>
-                </ItemsRepeater.ItemTemplate>
-              </ItemsRepeater>
+                </ListView.ItemTemplate>
+              </ListView>
 
               <!-- Persistent highlight overlay. Hosts composition SpriteVisuals
                    with a Win2D Multiply BlendEffect against a backdrop brush,
@@ -171,8 +217,7 @@
                 x:Name="PersistentHighlightOverlay"
                 IsHitTestVisible="False"
                 HorizontalAlignment="Stretch"
-                VerticalAlignment="Stretch"
-              />
+                VerticalAlignment="Stretch"/>
 
               <!-- Text-selection highlight overlay — drawn on top of all pages.
                    IsHitTestVisible="False" so pointer events pass through to ScrollView. -->
@@ -180,8 +225,7 @@
                 x:Name="HighlightOverlay"
                 IsHitTestVisible="False"
                 HorizontalAlignment="Stretch"
-                VerticalAlignment="Stretch"
-              />
+                VerticalAlignment="Stretch"/>
             </Grid>
           </ScrollView>
         </Grid>

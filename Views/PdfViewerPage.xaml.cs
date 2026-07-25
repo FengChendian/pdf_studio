@@ -53,8 +53,21 @@ public sealed partial class PdfViewerPage : Page
         FileName = filename;
         VirtualizingImages = new ImagesVirtualizingCollection(FileName);
         InitializeComponent();
+
+        // ListViewItem containers may swallow pointer events for their own
+        // interaction logic — hook the ScrollView handlers with
+        // handledEventsToo so text selection keeps working regardless.
+        PdfScrollViewer.AddHandler(PointerPressedEvent,
+            new PointerEventHandler(PdfScrollViewer_PointerPressed), true);
+        PdfScrollViewer.AddHandler(PointerMovedEvent,
+            new PointerEventHandler(PdfScrollViewer_PointerMoved), true);
+        PdfScrollViewer.AddHandler(PointerReleasedEvent,
+            new PointerEventHandler(PdfScrollViewer_PointerReleased), true);
+        PdfScrollViewer.AddHandler(PointerExitedEvent,
+            new PointerEventHandler(PdfScrollViewer_PointerExited), true);
+
         BuildColorPalette();
-        VirtualizingImages.CollectionChanged += OnVirtualizingImagesCollectionChanged;
+        VirtualizingImages.PageBitmapChanged += OnPageBitmapChanged;
         _ = LoadAsync();
     }
 
@@ -75,14 +88,15 @@ public sealed partial class PdfViewerPage : Page
 
     private void PdfScrollViewer_SizeChanged(object sender, SizeChangedEventArgs e)
     {
-        double availableWidth = e.NewSize.Width - 64; // ItemsRepeater margin (32 * 2)
+        double availableWidth = e.NewSize.Width - 64; // page list margin (32 * 2)
         if (availableWidth > 0 && Math.Abs(availableWidth - _lastAvailableWidth) > 1.0)
         {
             _lastAvailableWidth = availableWidth;
             VirtualizingImages.CalculateDisplaySizes(availableWidth);
             UpdatePageIndicator();
+            ScheduleHighResRender();
             RedrawAllOverlays();
-            // The repeater applies the new widths via bindings asynchronously —
+            // The list applies the new widths via bindings asynchronously —
             // schedule a second pass so highlights are mapped with settled sizes.
             ScheduleOverlayRedraw();
         }
@@ -93,13 +107,93 @@ public sealed partial class PdfViewerPage : Page
         UpdatePageIndicator();
 
         // A pending TOC-navigation correction retries here too — the
-        // completed scroll is what makes the repeater realize the target page.
-        if (_pendingCorrectionPage >= 0)
-            ApplyScrollCorrection();
+        // completed scroll is what makes the list realize the target page.
+        //if (_pendingCorrectionPage >= 0)
+        //    ApplyScrollCorrection();
+
+        // The ListView realizes every container up front (its inner scrolling
+        // is disabled), so nothing enqueues high-res renders on its own —
+        // trigger them from the viewport instead.
+        ScheduleHighResRender();
 
         // Debounce a redraw of the overlays so scrolling does not leave
         // stale or missing highlights on newly realized pages.
         ScheduleOverlayRedraw();
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Viewport-driven high-res rendering
+    // ════════════════════════════════════════════════════════════════
+
+    private DispatcherTimer? _highResRenderTimer;
+
+    /// <summary>
+    /// Debounced high-res render request (120 ms).  Used by scroll/zoom and
+    /// size changes to keep the pages around the viewport sharp.
+    /// </summary>
+    private void ScheduleHighResRender()
+    {
+        if (_highResRenderTimer == null)
+        {
+            _highResRenderTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(50)
+            };
+            _highResRenderTimer.Tick += (_, _) =>
+            {
+                _highResRenderTimer?.Stop();
+                EnsureVisiblePagesHighRes();
+            };
+        }
+
+        _highResRenderTimer.Stop();
+        _highResRenderTimer.Start();
+    }
+
+    /// <summary>
+    /// Enqueues high-res renders for the pages intersecting the viewport
+    /// (plus a one-page margin on each side).
+    /// </summary>
+    private void EnsureVisiblePagesHighRes()
+    {
+        int total = VirtualizingImages.Count;
+        if (total == 0) return;
+
+        // Layout not done yet (page heights still NaN/zero).
+        if (!((VirtualizingImages.GetPageItem(0)?.Height ?? 0) > 0)) return;
+
+        double zoom = PdfScrollViewer.ZoomFactor;
+        double top = PdfScrollViewer.VerticalOffset / zoom;
+        double bottom = top + PdfScrollViewer.ViewportHeight / zoom;
+
+        int first = Math.Max(0, FindPageIndexAtOffset(top) - 1);
+        int last = Math.Min(total - 1, FindPageIndexAtOffset(bottom) + 1);
+
+        for (int i = first; i <= last; i++)
+            VirtualizingImages.EnsureHighResRender(i);
+    }
+
+    /// <summary>
+    /// Binary-searches the cached page-top-offset table (sorted, unzoomed
+    /// DIPs) for the page containing <paramref name="y"/>.
+    /// </summary>
+    private int FindPageIndexAtOffset(double y)
+    {
+        int lo = 0, hi = VirtualizingImages.Count - 1, page = 0;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) / 2;
+            if (VirtualizingImages.GetPageTopOffset(mid) <= y)
+            {
+                page = mid;
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+        return page;
     }
 
     /// <summary>
@@ -126,38 +220,26 @@ public sealed partial class PdfViewerPage : Page
     }
 
     /// <summary>
-    /// Redraws selection highlights when a realized page is replaced (e.g.
-    /// high-res swap) if the page falls inside the current selection.
+    /// A page's bitmap was swapped in place (high-res upgrade, or downgrade
+    /// after LRU eviction).  The displayed DIP size never changes, but overlay
+    /// rects are mapped through the bitmap's pixel size — redraw when the page
+    /// is inside the current selection or carries persistent highlights.
     /// </summary>
-    private void OnVirtualizingImagesCollectionChanged(
-        object? sender, NotifyCollectionChangedEventArgs e)
+    private void OnPageBitmapChanged(object? sender, int pageIndex)
     {
-        if (e.Action == NotifyCollectionChangedAction.Reset)
+        bool needsRedraw = false;
+        if (_selectionStartPage >= 0 && _selectionEndPage >= 0)
         {
+            int from = Math.Min(_selectionStartPage, _selectionEndPage);
+            int to = Math.Max(_selectionStartPage, _selectionEndPage);
+            needsRedraw = pageIndex >= from && pageIndex <= to;
+        }
+
+        if (!needsRedraw)
+            needsRedraw = _highlights.Any(h => h.PageIndex == pageIndex);
+
+        if (needsRedraw)
             RedrawAllOverlays();
-            return;
-        }
-
-        if (e.Action == NotifyCollectionChangedAction.Replace &&
-            e.NewItems?.Count > 0 &&
-            e.NewItems[0] is PageImageItem item)
-        {
-            // Redraw when the replaced page is inside the current selection…
-            bool needsRedraw = false;
-            if (_selectionStartPage >= 0 && _selectionEndPage >= 0)
-            {
-                int from = Math.Min(_selectionStartPage, _selectionEndPage);
-                int to = Math.Max(_selectionStartPage, _selectionEndPage);
-                needsRedraw = item.PageIndex >= from && item.PageIndex <= to;
-            }
-
-            // …or when it carries persistent highlights.
-            if (!needsRedraw)
-                needsRedraw = _highlights.Any(h => h.PageIndex == item.PageIndex);
-
-            if (needsRedraw)
-                RedrawAllOverlays();
-        }
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -256,38 +338,21 @@ public sealed partial class PdfViewerPage : Page
         }
 
         // Layout not done yet (page heights all zero) — report page 1.
-        if ((VirtualizingImages.GetPlaceholder(0)?.Height ?? 0) <= 0)
+        if ((VirtualizingImages.GetPageItem(0)?.Height ?? 0) <= 0)
         {
             PageIndicator.Text = $"1 / {total}";
             return;
         }
 
         double zoom = PdfScrollViewer.ZoomFactor;
-        double center = (PdfScrollViewer.VerticalOffset + PdfScrollViewer.ViewportHeight / 2) / zoom;
+        double top = PdfScrollViewer.VerticalOffset / zoom;
 
-        // Cached offsets are sorted — binary search the page containing the viewport centre.
-        int lo = 0, hi = total - 1, page = 0;
-        while (lo <= hi)
-        {
-            int mid = (lo + hi) / 2;
-            if (VirtualizingImages.GetPageTopOffset(mid) <= center)
-            {
-                page = mid;
-                lo = mid + 1;
-            }
-            else
-            {
-                hi = mid - 1;
-            }
-        }
+        // Cached offsets are sorted — binary search the page containing the
+        // viewport top, matching TOC navigation which aligns the page to the top.
+        int page = FindPageIndexAtOffset(top);
 
         PageIndicator.Text = $"{page + 1} / {total}";
     }
-
-    // ── TOC scroll correction state ─────────────────────────────────
-    private DispatcherTimer? _scrollCorrectionTimer;
-    private int _pendingCorrectionPage = -1;
-    private int _scrollCorrectionAttempts;
 
     /// <summary>Scrolls so that the top of <paramref name="pageIndex"/> is visible.</summary>
     private void ScrollToPage(int pageIndex)
@@ -297,6 +362,9 @@ public sealed partial class PdfViewerPage : Page
         double y = VirtualizingImages.GetPageTopOffset(pageIndex);
 
         double zoom = PdfScrollViewer.ZoomFactor;
+        //Debug.WriteLine($"[Scroll] Page {pageIndex + 1} all offset: {VirtualizingImages.GetPageTopOffset(VirtualizingImages.Count)}, zoom: {zoom}");
+
+        //Debug.Print($"{PdfScrollViewer.ScrollableHeight}");
         // Instant jump (standard PDF-reader behaviour)…
         PdfScrollViewer.ScrollTo(
             PdfScrollViewer.HorizontalOffset,
@@ -304,76 +372,13 @@ public sealed partial class PdfViewerPage : Page
             new ScrollingScrollOptions(
                 ScrollingAnimationMode.Disabled,
                 ScrollingSnapPointsMode.Ignore));
-
-        // …then correct with the target page's measured position once the
-        // ItemsRepeater has realized it (the estimate above can drift a
-        // few DIPs per page due to bitmap aspect rounding).
-        _pendingCorrectionPage = pageIndex;
-        _scrollCorrectionAttempts = 0;
-
-        if (_scrollCorrectionTimer == null)
-        {
-            _scrollCorrectionTimer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(120)
-            };
-            _scrollCorrectionTimer.Tick += (_, _) => ApplyScrollCorrection();
-        }
-        _scrollCorrectionTimer.Stop();
-        _scrollCorrectionTimer.Start();
     }
 
     /// <summary>
     /// Fine-tunes the scroll offset using the realized page element's
     /// actual visual position.  Retries a few times while the target page
-    /// is still being materialized by the ItemsRepeater.
+    /// is still being materialized by the ListView.
     /// </summary>
-    private void ApplyScrollCorrection()
-    {
-        int pageIndex = _pendingCorrectionPage;
-        if (pageIndex < 0)
-        {
-            _scrollCorrectionTimer?.Stop();
-            return;
-        }
-
-        var image = GetPageImageElement(pageIndex);
-        if (image == null || image.ActualHeight <= 0)
-        {
-            // A far jump keeps the UI thread busy creating large high-res
-            // bitmaps — allow ~1.8 s before giving up on the correction.
-            if (++_scrollCorrectionAttempts >= 15)
-            {
-                _pendingCorrectionPage = -1;
-                _scrollCorrectionTimer?.Stop();
-            }
-            return;
-        }
-
-        var bounds = image.TransformToVisual(ContentGrid)
-            .TransformBounds(new Rect(0, 0, image.ActualWidth, image.ActualHeight));
-
-        double target = bounds.Y * PdfScrollViewer.ZoomFactor;
-        double delta = target - PdfScrollViewer.VerticalOffset;
-        if (Math.Abs(delta) > 0.5)
-        {
-            // The cached offset table is expected to be exact — log any
-            // measured discrepancy so future layout regressions are visible.
-            Debug.WriteLine(
-                $"[Scroll] TOC correction page {pageIndex}: measured delta {delta:F2} DIP " +
-                $"(zoom {PdfScrollViewer.ZoomFactor:F2})");
-
-            PdfScrollViewer.ScrollTo(
-                PdfScrollViewer.HorizontalOffset,
-                target,
-                new ScrollingScrollOptions(
-                    ScrollingAnimationMode.Disabled,
-                    ScrollingSnapPointsMode.Ignore));
-        }
-
-        _pendingCorrectionPage = -1;
-        _scrollCorrectionTimer?.Stop();
-    }
 
     // ════════════════════════════════════════════════════════════════
     //  Table of contents
@@ -817,13 +822,13 @@ public sealed partial class PdfViewerPage : Page
     /// </summary>
     /// <remarks>
     /// This method uses the actual visual-tree positions of the page images
-    /// instead of reconstructing the ItemsRepeater layout manually, so it stays
+    /// instead of reconstructing the page-stack layout manually, so it stays
     /// aligned with the rendered page after zoom, resize, and high-res replacement.
     /// </remarks>
     private (PageImageItem? Item, Point? PdfPoint) HitTestPageImage(
         PointerRoutedEventArgs e)
     {
-        var repeaterPoint = e.GetCurrentPoint(PagesRepeater).Position;
+        var listPoint = e.GetCurrentPoint(PagesList).Position;
 
         for (int i = 0; i < VirtualizingImages.Count; i++)
         {
@@ -837,12 +842,12 @@ public sealed partial class PdfViewerPage : Page
             if (image.ActualWidth <= 0 || image.ActualHeight <= 0)
                 continue;
 
-            var bounds = image.TransformToVisual(PagesRepeater)
+            var bounds = image.TransformToVisual(PagesList)
                 .TransformBounds(new Rect(0, 0, image.ActualWidth, image.ActualHeight));
 
-            if (bounds.Contains(repeaterPoint))
+            if (bounds.Contains(listPoint))
             {
-                var pdfPoint = MapRepeaterPointToPdf(repeaterPoint, image, item.PageIndex);
+                var pdfPoint = MapPagePointToPdf(listPoint, image, item.PageIndex);
                 if (pdfPoint.HasValue)
                     return (item, pdfPoint.Value);
             }
@@ -853,14 +858,29 @@ public sealed partial class PdfViewerPage : Page
 
     /// <summary>
     /// Returns the realized Image element for a page index, or null if the
-    /// ItemsRepeater has not materialized the container for that page.
+    /// ListView has not generated the container for that page yet.
     /// </summary>
     private Image? GetPageImageElement(int pageIndex)
     {
-        var element = PagesRepeater.TryGetElement(pageIndex);
-        if (element is Border border && border.Child is Image image)
-            return image;
+        if (PagesList.ContainerFromIndex(pageIndex) is not DependencyObject container)
+            return null;
 
+        return FindFirstDescendant<Image>(container);
+    }
+
+    private static T? FindFirstDescendant<T>(DependencyObject root)
+        where T : DependencyObject
+    {
+        int count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is T match)
+                return match;
+
+            if (FindFirstDescendant<T>(child) is { } found)
+                return found;
+        }
         return null;
     }
 
@@ -888,10 +908,10 @@ public sealed partial class PdfViewerPage : Page
     }
 
     /// <summary>
-    /// Maps a pointer position expressed in PagesRepeater coordinates to PDF
+    /// Maps a pointer position expressed in PagesList coordinates to PDF
     /// user-space coordinates for the page represented by the given Image.
     /// </summary>
-    private Point? MapRepeaterPointToPdf(Point pointInRepeater, Image image, int pageIndex)
+    private Point? MapPagePointToPdf(Point pointInList, Image image, int pageIndex)
     {
         if (image.ActualWidth <= 0 || image.ActualHeight <= 0)
             return null;
@@ -899,11 +919,11 @@ public sealed partial class PdfViewerPage : Page
         if (image.Source is not WriteableBitmap bitmap)
             return null;
 
-        var imageBoundsInRepeater = image.TransformToVisual(PagesRepeater)
+        var imageBoundsInList = image.TransformToVisual(PagesList)
             .TransformBounds(new Rect(0, 0, image.ActualWidth, image.ActualHeight));
 
-        double localX = pointInRepeater.X - imageBoundsInRepeater.X;
-        double localY = pointInRepeater.Y - imageBoundsInRepeater.Y;
+        double localX = pointInList.X - imageBoundsInList.X;
+        double localY = pointInList.Y - imageBoundsInList.Y;
 
         var bitmapRect = GetDisplayedBitmapRect(image, bitmap);
         if (bitmapRect.IsEmpty)
@@ -1379,7 +1399,7 @@ public sealed partial class PdfViewerPage : Page
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Data item for ItemsRepeater
+//  Data item for the page list
 // ════════════════════════════════════════════════════════════════
 
 public class PageImageItem : INotifyPropertyChanged
@@ -1446,16 +1466,21 @@ public class HighlightRect
 
 public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChanged, IDisposable
 {
-    private readonly Dictionary<int, PageImageItem> _placeHolderCache = [];
-    private readonly LinkedList<KeyValuePair<int, PageImageItem>> _highResCache = new();
-    // Weak refs to EVERY high-res item ever created.  Items evicted from the
-    // LRU can still be displayed by realized ItemsRepeater elements — without
-    // tracking them here, CalculateDisplaySizes would leave them at stale
-    // sizes after a width change (e.g. opening the TOC pane), which makes
-    // the page-offset table diverge from the actual layout.
-    private readonly List<WeakReference<PageImageItem>> _allHighResItems = [];
+    // One PageImageItem per page, created once at load and kept forever — a
+    // high-res upgrade is an in-place Image property swap on that instance.
+    // The ListView therefore never sees a collection change and never
+    // rebuilds a container: no blank frame, no full-stack re-layout.
+    private readonly Dictionary<int, PageImageItem> _pageItems = [];
+    // The original scale=1 bitmaps, kept so an LRU eviction can downgrade a
+    // page back to its placeholder and release the big high-res texture.
+    private WriteableBitmap?[] _placeholderBitmaps = [];
+    // LRU: page index → high-res bitmap (bitmaps only — the page items
+    // displaying them live in _pageItems).
+    private readonly LinkedList<KeyValuePair<int, WriteableBitmap>> _highResCache = new();
+    // Indices currently queued or rendering — deduplicates render requests.
+    private readonly HashSet<int> _inflight = [];
     private readonly object _cacheLock = new();
-    private const int MaxHighResCacheSize = 5;
+    private const int MaxHighResCacheSize = 12;
     private volatile int _currentRenderDpi = 400;
     private readonly Dictionary<int, (double Width, double Height)> _pageSizes = [];
     private readonly Dictionary<int, (double Left, double Bottom)> _pageOrigins = [];
@@ -1464,15 +1489,29 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     private readonly PDFiumService _pdfiumService;
     private int _pageCount;
 
-    // Background render channel: bounded queue, drops oldest when full.
+    // Background render channel: bounded queue; when full the newest write is
+    // dropped instead — the next viewport pass re-issues the request.
+    // (DropOldest would strand the dropped index in _inflight forever.)
     private readonly Channel<int> _renderChannel = Channel.CreateBounded<int>(
-        new BoundedChannelOptions(7) { FullMode = BoundedChannelFullMode.DropOldest });
+        new BoundedChannelOptions(7) { FullMode = BoundedChannelFullMode.DropWrite });
     private readonly Task _renderTask;
     private readonly CancellationTokenSource _cts = new();
     private readonly DispatcherQueue _dispatcher;
     private bool _disposed;
 
+    // Required by INotifyCollectionChanged so the ListView can subscribe, but
+    // never raised: items are permanent and upgrades are in-place property
+    // updates, so the collection itself never changes after load.
+#pragma warning disable CS0067
     public event NotifyCollectionChangedEventHandler? CollectionChanged;
+#pragma warning restore CS0067
+
+    /// <summary>
+    /// Raised on the UI thread when a page's bitmap is swapped in place —
+    /// upgraded to high-res, or downgraded back to the placeholder after an
+    /// LRU eviction.  The argument is the page index.
+    /// </summary>
+    public event EventHandler<int>? PageBitmapChanged;
 
     public ImagesVirtualizingCollection(string path)
     {
@@ -1503,6 +1542,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
         // Phase 2 — UI thread: create WriteableBitmap from raw bytes.
         var swPhase2 = Stopwatch.StartNew();
+        _placeholderBitmaps = new WriteableBitmap[_pageCount];
         for (int i = 0; i < _pageCount; i++)
         {
             var (w, h, pixels) = rawBuffers[i];
@@ -1510,7 +1550,8 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             // _pageSizes stores rendered dimensions at scale=1, which equals
             // PDF points (72 DPI → 1 pixel = 1 point).
             _pageSizes[i] = (w, h);
-            _placeHolderCache[i] = new PageImageItem { Image = bitmap, PageIndex = i };
+            _placeholderBitmaps[i] = bitmap;
+            _pageItems[i] = new PageImageItem { Image = bitmap, PageIndex = i };
         }
         swPhase2.Stop();
         Debug.WriteLine($"[PDFium] Phase 2 (create bitmaps) took {swPhase2.Elapsed.TotalMilliseconds:F1} ms");
@@ -1539,7 +1580,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         int entriesWithoutImage = 0;
         long managedOverhead = 0;
 
-        foreach (var kvp in _placeHolderCache)
+        foreach (var kvp in _pageItems)
         {
             var item = kvp.Value;
             if (item?.Image is { } bitmap)
@@ -1588,7 +1629,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         }
 
         // Dictionary overhead: buckets + entries (approximate)
-        long dictOverhead = _placeHolderCache.Count * 48;
+        long dictOverhead = _pageItems.Count * 48;
 
         long estimatedTotal = totalBitmapBytes + managedOverhead + dictOverhead;
         double totalMB = estimatedTotal / (1024.0 * 1024.0);
@@ -1600,8 +1641,8 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             : 0;
 
         Debug.WriteLine(
-            $"[PDFium] _placeHolderCache memory — " +
-            $"entries: {_placeHolderCache.Count} " +
+            $"[PDFium] _pageItems memory — " +
+            $"entries: {_pageItems.Count} " +
             $"(with image: {entriesWithImage}, w/o image: {entriesWithoutImage}), " +
             $"total pixels: {totalPixels:N0}, " +
             $"raw BGRA32: {rawMB:F1} MB, " +
@@ -1609,7 +1650,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             $"estimated total: {totalMB:F1} MB");
 
         // Per-page breakdown for large caches (>10 pages)
-        if (_placeHolderCache.Count > 10)
+        if (_pageItems.Count > 10)
         {
             long avgBitmapKB = entriesWithImage > 0
                 ? totalBitmapBytes / entriesWithImage / 1024
@@ -1618,7 +1659,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                 ? totalPngBytes / entriesWithImage / 1024
                 : 0;
             Debug.WriteLine(
-                $"[PDFium] _placeHolderCache per-page avg: raw {avgBitmapKB} KB, " +
+                $"[PDFium] _pageItems per-page avg: raw {avgBitmapKB} KB, " +
                 $"PNG {avgPngKB} KB " +
                 $"({totalBitmapBytes / 1024 / 1024} MB → {totalPngBytes / 1024 / 1024} MB / {entriesWithImage} bitmaps)");
         }
@@ -1653,7 +1694,9 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
 
         lock (_cacheLock)
         {
-            foreach (var cacheEntry in _placeHolderCache)
+            // Every page shares one permanent PageImageItem (even pages
+            // currently showing a high-res bitmap), so this reaches them all.
+            foreach (var cacheEntry in _pageItems)
             {
                 double scale = _pageSizes[cacheEntry.Key].Width / maxWidth;
                 var item = cacheEntry.Value;
@@ -1661,30 +1704,14 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                 item.ContainerWidth = _containerWidth;
                 item.Height = HeightFor(cacheEntry.Key, item.Width);
             }
-
-            // Update every live high-res item — including ones already
-            // evicted from the LRU but still displayed by the repeater.
-            for (int i = _allHighResItems.Count - 1; i >= 0; i--)
-            {
-                if (!_allHighResItems[i].TryGetTarget(out var item))
-                {
-                    _allHighResItems.RemoveAt(i); // collected — prune
-                    continue;
-                }
-
-                double scale = _pageSizes[item.PageIndex].Width / maxWidth;
-                item.Width = availableWidth * scale;
-                item.ContainerWidth = _containerWidth;
-                item.Height = HeightFor(item.PageIndex, item.Width);
-            }
         }
 
-        // No longer firing Reset — PageImageItem.PropertyChanged handles UI updates.
+        // No Reset — PageImageItem.PropertyChanged applies the new sizes in place.
 
         // Rebuild the cumulative top-offset table (DIP, unzoomed) used by
         // TOC navigation and the page indicator.  O(n), heights are
         // deterministic (point-space aspect), so the table is exact.
-        var offsets = new double[_pageCount];
+        var offsets = new double[_pageCount + 1];
         double acc = 0;
         for (int i = 0; i < _pageCount; i++)
         {
@@ -1692,10 +1719,11 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
             double scale = _pageSizes[i].Width / maxWidth;
             acc += HeightFor(i, availableWidth * scale) + PageSpacingDips;
         }
+        offsets[_pageCount] = acc;
         _pageTopOffsets = offsets;
     }
 
-    /// <summary>Vertical spacing between pages — must match the ItemsRepeater StackLayout Spacing in XAML.</summary>
+    /// <summary>Vertical spacing between pages — must match the ListViewItem bottom margin in XAML.</summary>
     public const double PageSpacingDips = 16;
 
     private double[] _pageTopOffsets = [];
@@ -1748,53 +1776,42 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
                 if (!_renderChannel.Reader.TryRead(out var index))
                     continue;
 
-                // Check high-res cache — if already present, move to LRU tail & notify UI.
-                PageImageItem? cachedItem = null;
+                // Already cached (e.g. re-queued by ReRenderCachedPages) — the
+                // page item already shows this bitmap; just refresh the LRU.
+                bool alreadyCached;
                 lock (_cacheLock)
                 {
-                    var node = _highResCache.First;
-                    while (node != null)
-                    {
-                        if (node.Value.Key == index)
-                        {
-                            var value = node.Value;
-                            _highResCache.Remove(node);
-                            _highResCache.AddLast(value);
-                            cachedItem = value.Value;
-                            break;
-                        }
-                        node = node.Next;
-                    }
+                    alreadyCached = TouchHighResCache(index);
+                    if (alreadyCached)
+                        _inflight.Remove(index);
                 }
-
-                if (cachedItem != null)
-                {
-                    _dispatcher.TryEnqueue(() =>
-                    {
-                        _placeHolderCache.TryGetValue(index, out var oldValue);
-                        Debug.WriteLine("Loop rerender in cache");
-                        OnCollectionChanged(
-                            new NotifyCollectionChangedEventArgs(
-                                NotifyCollectionChangedAction.Replace,
-                                cachedItem,
-                                oldValue,
-                                index
-                            )
-                        );
-                    });
+                if (alreadyCached)
                     continue;
-                }
 
                 // Phase 1 — background thread: PDFium render to raw bytes.
                 // scale = dpi / 72 (e.g. 400/72 ≈ 5.56, 600/72 ≈ 8.33).
                 int renderDpi = _currentRenderDpi;
                 float scale = renderDpi / 72f;
-                var (width, height, pixels) = _pdfiumService.RenderPageToRawBuffer(
-                    _filePath, index, scale);
+
+                int width, height;
+                byte[] pixels;
+                try
+                {
+                    (width, height, pixels) = _pdfiumService.RenderPageToRawBuffer(
+                        _filePath, index, scale);
+                }
+                catch (Exception ex)
+                {
+                    // A failed render must not kill the loop or strand the
+                    // index in _inflight (that page would stay blurry forever).
+                    Debug.WriteLine($"[PDFium] High-res render failed for page {index}: {ex.Message}");
+                    lock (_cacheLock)
+                        _inflight.Remove(index);
+                    continue;
+                }
 
                 // Phase 2 — UI thread: create WriteableBitmap & finalize.
                 int capturedDpi = renderDpi;
-                
                 _dispatcher.TryEnqueue(() => FinalizeRender(index, width, height, pixels, capturedDpi));
             }
         }
@@ -1805,66 +1822,117 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     }
 
     /// <summary>
-    /// Called on the UI thread: creates a <see cref="WriteableBitmap"/> from the raw
-    /// buffer, manages the high-res cache, and fires <see cref="CollectionChanged"/>
-    /// so the ItemsRepeater picks up the new bitmap.
+    /// Moves <paramref name="index"/> to the LRU tail.  Returns false when the
+    /// index is not cached.  Caller must hold <see cref="_cacheLock"/>.
+    /// </summary>
+    private bool TouchHighResCache(int index)
+    {
+        for (var node = _highResCache.First; node != null; node = node.Next)
+        {
+            if (node.Value.Key == index)
+            {
+                var value = node.Value;
+                _highResCache.Remove(node);
+                _highResCache.AddLast(value);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Called on the UI thread: creates a <see cref="WriteableBitmap"/> from the
+    /// raw buffer and swaps it into the page's existing <see cref="PageImageItem"/>
+    /// via the <c>Image</c> property.  No collection notification — the ListView
+    /// keeps its container and only the Image element's texture changes, so the
+    /// placeholder stays on screen until the high-res bitmap is ready (no blank
+    /// frame, no re-layout).
     /// </summary>
     private void FinalizeRender(int index, int width, int height, byte[] pixels, int renderDpi)
     {
+        lock (_cacheLock)
+            _inflight.Remove(index);
+
         if (renderDpi != _currentRenderDpi)
             return;
 
         // WriteableBitmap must be created on the UI thread — and we are on it.
         var bitmap = PDFiumService.CreateWriteableBitmapFromRawBuffer(width, height, pixels);
 
-        double placeholderWidth = _placeHolderCache.TryGetValue(index, out var ph) ? ph.Width : double.NaN;
-        double itemHeight = double.NaN;
-        if (!double.IsNaN(placeholderWidth) && placeholderWidth > 0 &&
-            _pageSizes.TryGetValue(index, out var pageSize) && pageSize.Width > 0)
-        {
-            // Point-space aspect — consistent with CalculateDisplaySizes so a
-            // high-res swap never changes the displayed page height.
-            itemHeight = placeholderWidth * (pageSize.Height / pageSize.Width);
-        }
-
-        var item = new PageImageItem
-        {
-            Image = bitmap,
-            PageIndex = index,
-            Width = placeholderWidth,
-            Height = itemHeight,
-            ContainerWidth = _containerWidth
-        };
-
+        List<int>? evictedPages = null;
         lock (_cacheLock)
         {
             // Add to tail (most recent).
-            _highResCache.AddLast(new KeyValuePair<int, PageImageItem>(index, item));
+            _highResCache.AddLast(new KeyValuePair<int, WriteableBitmap>(index, bitmap));
+
             // Evict oldest when over capacity.
             while (_highResCache.Count > MaxHighResCacheSize)
             {
+                evictedPages ??= [];
+                evictedPages.Add(_highResCache.First!.Value.Key);
                 _highResCache.RemoveFirst();
             }
-
-            // Track the item so future width changes still reach it after
-            // LRU eviction (a realized repeater element keeps it alive).
-            _allHighResItems.Add(new WeakReference<PageImageItem>(item));
         }
 
-        _placeHolderCache.TryGetValue(index, out var oldValue);
-        OnCollectionChanged(
-            new NotifyCollectionChangedEventArgs(
-                NotifyCollectionChangedAction.Replace,
-                item,
-                oldValue,
-                index
-            )
-        );
+        // Downgrade evicted pages back to their placeholder bitmaps, releasing
+        // the big high-res textures.  The LRU head is the least-recently needed
+        // page — normally far outside the viewport, so this is invisible.
+        if (evictedPages != null)
+        {
+            foreach (int evicted in evictedPages)
+            {
+                if ((uint)evicted < (uint)_placeholderBitmaps.Length &&
+                    _placeholderBitmaps[evicted] is { } placeholder &&
+                    _pageItems.TryGetValue(evicted, out var evictedItem) &&
+                    !ReferenceEquals(evictedItem.Image, placeholder))
+                {
+                    evictedItem.Image = placeholder;
+                    PageBitmapChanged?.Invoke(this, evicted);
+                }
+            }
+        }
+
+        // In-place upgrade: same item instance, new Image value.
+        if (_pageItems.TryGetValue(index, out var item))
+            item.Image = bitmap;
+
+        PageBitmapChanged?.Invoke(this, index);
+    }
+
+    /// <summary>
+    /// Ensures a high-res render is queued for <paramref name="index"/>.
+    /// (The page ListView's inner scrolling is disabled, so it has no viewport
+    /// and no realization ever triggers a render — the host drives this from
+    /// the ScrollView viewport instead.)
+    /// Must be called on the UI thread.
+    /// </summary>
+    public void EnsureHighResRender(int index)
+    {
+        lock (_cacheLock)
+        {
+            // Already rendered — the page item already shows the bitmap;
+            // just refresh the LRU position.
+            if (TouchHighResCache(index))
+                return;
+        }
+
+        EnqueueRender(index);
     }
 
     private void EnqueueRender(int index)
     {
-        _renderChannel.Writer.TryWrite(index);
+        lock (_cacheLock)
+        {
+            if (!_inflight.Add(index))
+                return; // already queued or rendering
+        }
+
+        if (!_renderChannel.Writer.TryWrite(index))
+        {
+            // Queue full — drop the request; the next viewport pass re-issues it.
+            lock (_cacheLock)
+                _inflight.Remove(index);
+        }
     }
 
     // ════════════════════════════════════════════════════════════
@@ -1891,13 +1959,13 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     public double ContainerWidth => _containerWidth;
 
     /// <summary>
-    /// Returns the placeholder item for <paramref name="index"/> without any
+    /// Returns the permanent page item for <paramref name="index"/> without any
     /// side effects — no render enqueue, no LRU manipulation.  Safe to call
     /// from hot paths such as hit‑testing.
     /// </summary>
-    public PageImageItem? GetPlaceholder(int index)
+    public PageImageItem? GetPageItem(int index)
     {
-        _placeHolderCache.TryGetValue(index, out var item);
+        _pageItems.TryGetValue(index, out var item);
         return item;
     }
 
@@ -1908,45 +1976,26 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     public string FilePath => _filePath;
 
     // ════════════════════════════════════════════════════════════
-    //  IList — ItemsRepeater virtualizing access
+    //  IList — virtualizing access for the items control
     // ════════════════════════════════════════════════════════════
 
     public object? this[int index]
     {
         get
         {
-            //Debug.WriteLine("Get index {0}", index);
-            lock (_cacheLock)
-            {
-               for (var node = _highResCache.First; node != null; node = node.Next)
-               {
-                   if (node.Value.Key == index)
-                   {
-                       var value = node.Value;
-                       _highResCache.Remove(node);
-                       _highResCache.AddLast(value);
-                       return value.Value;
-                   }
-               }
-            }
-
-            EnqueueRender(index);
-
-            _placeHolderCache.TryGetValue(index, out PageImageItem? placeHolderItem);
-            return placeHolderItem;
+            // Pure lookup — high-res rendering is driven from the viewport
+            // (EnsureHighResRender), not from container realization.
+            _pageItems.TryGetValue(index, out PageImageItem? item);
+            return item;
         }
         set
         {
-            // Set by ItemsRepeater internally; handled via Replace notification.
+            // Items are never replaced — high-res upgrades are in-place
+            // property updates on the existing PageImageItem.
         }
     }
 
     public int Count => _pageCount;
-
-    protected virtual void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
-    {
-        CollectionChanged?.Invoke(this, e);
-    }
 
     // ════════════════════════════════════════════════════════════
     //  IDisposable
@@ -1965,7 +2014,7 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
     }
 
     // ════════════════════════════════════════════════════════════
-    //  Remaining IList members (unused by ItemsRepeater)
+    //  Remaining IList members (unused by the items control)
     // ════════════════════════════════════════════════════════════
 
     public bool IsFixedSize => true;
