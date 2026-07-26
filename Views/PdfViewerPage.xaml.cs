@@ -246,11 +246,6 @@ public sealed partial class PdfViewerPage : Page
     //  Toolbar: TOC, highlight pen, page indicator
     // ════════════════════════════════════════════════════════════════
 
-    private void TocToggle_Toggled(object sender, RoutedEventArgs e)
-    {
-        TocSplitView.IsPaneOpen = TocToggle.IsChecked == true;
-    }
-
     private void TocSplitView_PaneToggled(SplitView sender, object args)
     {
         // Pane animation changed the content width; layout/bindings may still
@@ -1566,9 +1561,9 @@ public partial class ImagesVirtualizingCollection : IList, INotifyCollectionChan
         swTotal.Stop();
         Debug.WriteLine($"[PDFium] InitializePlaceholdersAsync total: {swTotal.Elapsed.TotalMilliseconds:F1} ms");
 
-//#if DEBUG
-//        await EvaluatePlaceholderCacheMemoryAsync();
-//#endif
+        //#if DEBUG
+        //        await EvaluatePlaceholderCacheMemoryAsync();
+        //#endif
     }
 
     private async Task EvaluatePlaceholderCacheMemoryAsync()

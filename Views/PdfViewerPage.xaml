@@ -9,19 +9,19 @@
          visuals, no padding, no min-size.  The 16 DIP bottom margin is the
          inter-page spacing — it must match PageSpacingDips in code-behind. -->
     <Style x:Key="PageItemContainerStyle"
-        TargetType="ListViewItem">
+           TargetType="ListViewItem">
       <Setter Property="Padding"
-          Value="0"/>
+              Value="0"/>
       <Setter Property="Margin"
-          Value="0,0,0,16"/>
+              Value="0,0,0,16"/>
       <Setter Property="MinWidth"
-          Value="0"/>
+              Value="0"/>
       <Setter Property="MinHeight"
-          Value="0"/>
+              Value="0"/>
       <Setter Property="HorizontalContentAlignment"
-          Value="Stretch"/>
+              Value="Stretch"/>
       <Setter Property="VerticalContentAlignment"
-          Value="Stretch"/>
+              Value="Stretch"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ListViewItem">
@@ -44,11 +44,11 @@
 
     <Grid.KeyboardAccelerators>
       <KeyboardAccelerator Key="S"
-          Modifiers="Control"
-          Invoked="OnSaveAccelerator"/>
+                           Modifiers="Control"
+                           Invoked="OnSaveAccelerator"/>
       <KeyboardAccelerator Key="Z"
-          Modifiers="Control"
-          Invoked="OnUndoAccelerator"/>
+                           Modifiers="Control"
+                           Invoked="OnUndoAccelerator"/>
     </Grid.KeyboardAccelerators>
 
     <!-- ══ Toolbar: [TOC] | [highlight pen + colors] | [page x / y] ══ -->
@@ -69,11 +69,9 @@
         <ToggleButton
           x:Name="TocToggle"
           Grid.Column="0"
-          Checked="TocToggle_Toggled"
-          Unchecked="TocToggle_Toggled"
           ToolTipService.ToolTip="目录">
           <FontIcon Glyph="&#xE8A4;"
-              FontSize="16"/>
+                    FontSize="16"/>
         </ToggleButton>
 
         <!-- Center: highlight pen + color palette -->
@@ -88,7 +86,7 @@
             Unchecked="HighlightPenToggle_Toggled"
             ToolTipService.ToolTip="高亮笔">
             <FontIcon Glyph="&#xE76D;"
-                FontSize="16"/>
+                      FontSize="16"/>
           </ToggleButton>
 
           <StackPanel
@@ -115,7 +113,7 @@
       Grid.Row="1"
       x:Name="TocSplitView"
       DisplayMode="Overlay"
-      IsPaneOpen="False"
+      IsPaneOpen="{Binding IsChecked, ElementName=TocToggle, Mode=TwoWay}"
       OpenPaneLength="300"
       PanePlacement="Left"
       PaneOpened="TocSplitView_PaneToggled"
@@ -142,7 +140,7 @@
         <Grid>
           <!-- Loading overlay -->
           <Border x:Name="LoadingOverlay"
-              Background="Transparent">
+                  Background="Transparent">
             <ProgressRing
               x:Name="LoadingIndicator"
               IsActive="True"
@@ -200,10 +198,10 @@
                   <DataTemplate>
                     <Border Width="{Binding ContainerWidth}">
                       <Image Source="{Binding Image}"
-                          Width="{Binding Width}"
-                          Height="{Binding Height}"
-                          Stretch="Uniform"
-                          HorizontalAlignment="Center"/>
+                             Width="{Binding Width}"
+                             Height="{Binding Height}"
+                             Stretch="Uniform"
+                             HorizontalAlignment="Center"/>
                     </Border>
                   </DataTemplate>
                 </ListView.ItemTemplate>
