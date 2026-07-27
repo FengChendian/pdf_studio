@@ -657,9 +657,16 @@ namespace pdf_studio.Services
                                         continue;
 
                                     uint r = 0, g = 0, b = 0, a = 0;
-                                    fpdf_annot.FPDFAnnotGetColor(annot,
-                                        FPDFANNOT_COLORTYPE.FPDFANNOT_COLORTYPE_Color,
-                                        ref r, ref g, ref b, ref a);
+                                    if (fpdf_annot.FPDFAnnotGetColor(annot,
+                                            FPDFANNOT_COLORTYPE.FPDFANNOT_COLORTYPE_Color,
+                                            ref r, ref g, ref b, ref a) == 0)
+                                    {
+                                        // No /C entry — the producer baked the color into
+                                        // the /AP appearance stream (or omitted it entirely).
+                                        // Fall back to the de-facto standard highlighter
+                                        // yellow instead of the (0,0,0) the call leaves behind.
+                                        r = 255; g = 235; b = 59;
+                                    }
 
                                     var rects = new List<PdfRect>();
                                     ulong quadCount = fpdf_annot.FPDFAnnotCountAttachmentPoints(annot);
