@@ -665,7 +665,7 @@ namespace pdf_studio.Services
                                         // the /AP appearance stream (or omitted it entirely).
                                         // Fall back to the de-facto standard highlighter
                                         // yellow instead of the (0,0,0) the call leaves behind.
-                                        r = 255; g = 235; b = 59;
+                                        r = 255; g = 235; b = 59; a = 255;
                                     }
 
                                     var rects = new List<PdfRect>();
@@ -680,7 +680,7 @@ namespace pdf_studio.Services
                                     if (rects.Count > 0)
                                     {
                                         result.Add(new PdfHighlight(p, rects,
-                                            Windows.UI.Color.FromArgb(255, (byte)r, (byte)g, (byte)b)));
+                                            Windows.UI.Color.FromArgb((byte)a, (byte)r, (byte)g, (byte)b)));
                                     }
                                 }
                                 finally
@@ -796,7 +796,8 @@ namespace pdf_studio.Services
             {
                 fpdf_annot.FPDFAnnotSetColor(annot,
                     FPDFANNOT_COLORTYPE.FPDFANNOT_COLORTYPE_Color,
-                    highlight.Color.R, highlight.Color.G, highlight.Color.B, 255);
+                    highlight.Color.R, highlight.Color.G, highlight.Color.B,
+                    highlight.Alpha);
 
                 double left = highlight.Rects.Min(r => r.L);
                 double right = highlight.Rects.Max(r => r.R);

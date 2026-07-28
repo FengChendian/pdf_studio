@@ -456,6 +456,9 @@ public sealed partial class PdfViewerPage : Page
     /// <summary>Raised when the unsaved-changes state flips (for the tab header asterisk).</summary>
     public event EventHandler<bool>? DirtyStateChanged;
 
+    /// <summary>True while there are highlights that have not been saved to the PDF.</summary>
+    public bool HasUnsavedChanges => IsDirty;
+
     private bool _isDirty;
     private bool IsDirty
     {
@@ -596,7 +599,7 @@ public sealed partial class PdfViewerPage : Page
         RebuildPersistentHighlightVisuals();
     }
 
-    private async Task SaveHighlightsAsync()
+    public async Task SaveHighlightsAsync()
     {
         if (!IsDirty) return;
 

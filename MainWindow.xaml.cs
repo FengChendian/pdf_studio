@@ -139,12 +139,53 @@ public sealed partial class MainWindow : Window
         MainTabView.SelectedItem = tabItem;
     }
 
-    private void OnTabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
+    private async void OnTabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
     {
-        if (args.Tab is TabViewItem tab && tab.IsClosable)
+        if (args.Tab is not TabViewItem tab || !tab.IsClosable)
         {
-            MainTabView.TabItems.Remove(tab);
+            return;
         }
+
+        if (tab.Content is PdfViewerPage pdfPage && pdfPage.HasUnsavedChanges)
+        {
+            var fileName = tab.Tag is string path
+                ? Path.GetFileName(path)
+                : tab.Header?.ToString() ?? string.Empty;
+
+            var result = await ShowUnsavedHighlightsDialog(fileName);
+            if (result == ContentDialogResult.Primary)
+            {
+                await pdfPage.SaveHighlightsAsync();
+                // The page shows its own error dialog on failure; keep the
+                // tab open if the highlights are still unsaved.
+                if (pdfPage.HasUnsavedChanges)
+                {
+                    return;
+                }
+            }
+            else if (result != ContentDialogResult.Secondary)
+            {
+                // Cancel — keep the tab open.
+                return;
+            }
+        }
+
+        MainTabView.TabItems.Remove(tab);
+    }
+
+    private async Task<ContentDialogResult> ShowUnsavedHighlightsDialog(string fileName)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "未保存的高亮",
+            Content = $"“{fileName}” 中还有未保存的高亮。关闭前是否保存？",
+            PrimaryButtonText = "保存",
+            SecondaryButtonText = "不保存",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = this.Content.XamlRoot,
+        };
+        return await dialog.ShowAsync();
     }
 
     private void OnAddTabButtonClick(TabView sender, object args)

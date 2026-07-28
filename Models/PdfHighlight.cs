@@ -15,6 +15,12 @@ public sealed class PdfHighlight
     public List<PdfRect> Rects { get; }
     public Windows.UI.Color Color { get; set; }
 
+    /// <summary>
+    /// Opacity of the highlight (0-255), taken from <see cref="Color"/>'s
+    /// alpha channel so on-screen rendering and PDF persistence always agree.
+    /// </summary>
+    public byte Alpha => Color.A;
+
     public PdfHighlight(int pageIndex, List<PdfRect> rects, Windows.UI.Color color)
     {
         PageIndex = pageIndex;
