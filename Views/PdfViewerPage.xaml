@@ -36,7 +36,9 @@
     </Style>
   </Page.Resources>
 
-  <Grid>
+  <!-- Transparent background keeps the whole page hit-testable for
+       window-level drag & drop (e.g. gaps between PDF pages). -->
+  <Grid Background="Transparent">
     <Grid.RowDefinitions>
       <RowDefinition Height="40"/>
       <RowDefinition Height="*"/>

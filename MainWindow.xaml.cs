@@ -6,6 +6,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using pdf_studio.Services;
 using pdf_studio.Views;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.Storage;
 using Windows.Storage.Pickers;
 using WinRT.Interop;
 
@@ -20,7 +22,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        AppWindow.SetIcon("Assets/light_icon.ico");
+        AppWindow.SetIcon("Assets/icon.ico");
         InitializeAsync();
     }
 
@@ -204,5 +206,86 @@ public sealed partial class MainWindow : Window
             XamlRoot = this.Content.XamlRoot,
         };
         await dialog.ShowAsync();
+    }
+
+    // ----- Drag & drop -----
+
+    private static bool IsPdfItem(IStorageItem item) =>
+        item is StorageFile file && file.FileType.Equals(".pdf", StringComparison.OrdinalIgnoreCase);
+
+    private async void OnDragOver(object sender, DragEventArgs e)
+    {
+        // Inspecting the dragged items is async, so hold a deferral to keep
+        // the drag operation alive while we check for PDF files.
+        var deferral = e.GetDeferral();
+        try
+        {
+            var hasPdf = false;
+            if (e.DataView.Contains(StandardDataFormats.StorageItems))
+            {
+                var items = await e.DataView.GetStorageItemsAsync();
+                hasPdf = items.Any(IsPdfItem);
+            }
+
+            if (hasPdf)
+            {
+                e.AcceptedOperation = DataPackageOperation.Copy;
+                e.DragUIOverride.Caption = "打开 PDF";
+                e.DragUIOverride.IsCaptionVisible = true;
+                e.DragUIOverride.IsGlyphVisible = true;
+                DropOverlay.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                // Non-PDF content — refuse the drop and keep the overlay hidden.
+                e.AcceptedOperation = DataPackageOperation.None;
+                DropOverlay.Visibility = Visibility.Collapsed;
+            }
+            e.Handled = true;
+        }
+        finally
+        {
+            deferral.Complete();
+        }
+    }
+
+    private void OnDragLeave(object sender, DragEventArgs e)
+    {
+        DropOverlay.Visibility = Visibility.Collapsed;
+    }
+
+    private async void OnDrop(object sender, DragEventArgs e)
+    {
+        DropOverlay.Visibility = Visibility.Collapsed;
+
+        if (!e.DataView.Contains(StandardDataFormats.StorageItems))
+        {
+            return;
+        }
+
+        var items = await e.DataView.GetStorageItemsAsync();
+        foreach (var item in items.Where(IsPdfItem).Cast<StorageFile>())
+        {
+            if (!string.IsNullOrEmpty(item.Path) && File.Exists(item.Path))
+            {
+                OpenPdfInTab(item.Path, item.Name);
+                continue;
+            }
+
+            // Files dragged from virtual locations (zip archives, phones,
+            // network stubs) have no local path — copy to a temp folder first.
+            try
+            {
+                var tempDir = Path.Combine(Path.GetTempPath(), "pdf_studio", "dropped");
+                Directory.CreateDirectory(tempDir);
+                var tempFolder = await StorageFolder.GetFolderFromPathAsync(tempDir);
+                var copy = await item.CopyAsync(tempFolder, item.Name, NameCollisionOption.GenerateUniqueName);
+                OpenPdfInTab(copy.Path, copy.Name);
+            }
+            catch
+            {
+                // Best effort only — skip files that cannot be materialized locally.
+            }
+        }
     }
 }

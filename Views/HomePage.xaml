@@ -5,7 +5,10 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="using:pdf_studio.Views">
 
-    <Grid HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="600">
+    <!-- Transparent background makes the whole page hit-testable so that
+         drag & drop events bubble up to the main window from anywhere. -->
+    <Grid Background="Transparent">
+        <Grid HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="600">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -95,5 +98,6 @@
                 </ListView.ItemTemplate>
             </ListView>
         </StackPanel>
+        </Grid>
     </Grid>
 </Page>
