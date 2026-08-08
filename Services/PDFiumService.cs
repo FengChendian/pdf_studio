@@ -1,5 +1,4 @@
 using Microsoft.UI.Xaml.Media.Imaging;
-using mupdf;
 using PDFiumCore;
 using pdf_studio.Models;
 using System;

@@ -20,6 +20,8 @@ SetCompressor /SOLID lzma
 !define APP_PUBLISHER "PDF Studio"
 !define APP_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${APP_EXE}"
 !define UNINST_REGKEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
+!define APP_PROGID     "PdfStudio.pdf"
+!define CAP_REGKEY     "Software\${APP_NAME}\Capabilities"
 !define SOURCE_DIR     "..\bin\win-x64\publish"
 !define APP_ICON       "..\Assets\icon.ico"
 
@@ -96,6 +98,50 @@ FunctionEnd
 !macroend
 
 ; --------------------------------------------------------------
+;  Helper: tell the shell that file associations changed
+; --------------------------------------------------------------
+!define SHCNE_ASSOCCHANGED 0x08000000
+!macro NotifyShellAssocChanged
+  System::Call 'shell32::SHChangeNotify(i ${SHCNE_ASSOCCHANGED}, i 0, p 0, p 0)'
+!macroend
+
+; --------------------------------------------------------------
+;  Helper: register / unregister the .pdf file association
+; --------------------------------------------------------------
+!macro RegisterFileAssociation
+  ; ProgID: friendly name, icon and open command
+  WriteRegStr HKLM "Software\Classes\${APP_PROGID}" "" "PDF Document"
+  ; Separate file-type icon, so .pdf files don't show the application
+  ; icon itself. The WinUI content pipeline preserves the Assets\
+  ; folder structure in the publish output, hence the subfolder path.
+  WriteRegStr HKLM "Software\Classes\${APP_PROGID}\DefaultIcon" "" "$INSTDIR\Assets\pdf_filetype.ico,0"
+  WriteRegStr HKLM "Software\Classes\${APP_PROGID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+
+  ; Show up in the .pdf "Open with" list
+  WriteRegStr HKLM "Software\Classes\.pdf\OpenWithProgids" "${APP_PROGID}" ""
+
+  ; RegisteredApplications + Capabilities so the app appears in
+  ; Settings -> Default apps. Note: Windows 10/11 does not allow an
+  ; installer to force itself as the default handler (UserChoice is
+  ; hash-protected); the user picks PDF Studio via Open With/Settings.
+  WriteRegStr HKLM "${CAP_REGKEY}" "ApplicationName" "${APP_NAME}"
+  WriteRegStr HKLM "${CAP_REGKEY}" "ApplicationDescription" "A PDF reader."
+  WriteRegStr HKLM "${CAP_REGKEY}\FileAssociations" ".pdf" "${APP_PROGID}"
+  WriteRegStr HKLM "Software\RegisteredApplications" "${APP_NAME}" "${CAP_REGKEY}"
+
+  !insertmacro NotifyShellAssocChanged
+!macroend
+
+!macro UnregisterFileAssociation
+  DeleteRegKey HKLM "Software\Classes\${APP_PROGID}"
+  DeleteRegValue HKLM "Software\Classes\.pdf\OpenWithProgids" "${APP_PROGID}"
+  DeleteRegKey HKLM "Software\${APP_NAME}"
+  DeleteRegValue HKLM "Software\RegisteredApplications" "${APP_NAME}"
+
+  !insertmacro NotifyShellAssocChanged
+!macroend
+
+; --------------------------------------------------------------
 ;  Install
 ; --------------------------------------------------------------
 Section "!${APP_NAME} (required)" SecMain
@@ -113,6 +159,9 @@ Section "!${APP_NAME} (required)" SecMain
   ; App Paths registration
   WriteRegStr HKLM "${APP_DIR_REGKEY}" "" "$INSTDIR\${APP_EXE}"
   WriteRegStr HKLM "${APP_DIR_REGKEY}" "Path" "$INSTDIR"
+
+  ; .pdf file association (ProgID, Open With, Default Apps capability)
+  !insertmacro RegisterFileAssociation
 
   ; Uninstaller
   WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -135,7 +184,10 @@ Section "!${APP_NAME} (required)" SecMain
   ; Start Menu shortcuts
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
-  CreateShortcut "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk" "$INSTDIR\Uninstall.exe" "" "$INSTDIR\Uninstall.exe" 0
+
+  ; Remove the uninstall shortcut left behind by older versions.
+  ; Uninstallation lives in Settings > Apps (Add/Remove Programs).
+  Delete "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk"
 SectionEnd
 
 Section "Desktop shortcut" SecDesktop
@@ -159,7 +211,6 @@ Section "Uninstall"
   ; Remove shortcuts
   Delete "$DESKTOP\${APP_NAME}.lnk"
   Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
-  Delete "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk"
   RMDir "$SMPROGRAMS\${APP_NAME}"
 
   ; Remove installed files
@@ -168,4 +219,5 @@ Section "Uninstall"
   ; Remove registry entries
   DeleteRegKey HKLM "${UNINST_REGKEY}"
   DeleteRegKey HKLM "${APP_DIR_REGKEY}"
+  !insertmacro UnregisterFileAssociation
 SectionEnd

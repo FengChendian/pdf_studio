@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -18,6 +19,8 @@ public sealed partial class MainWindow : Window
     private HistoryService _historyService = new();
     private HomePage? _homePage;
     private TabViewItem? _homeTab;
+    private bool _initialized;
+    private string? _pendingFilePath;
 
     public MainWindow()
     {
@@ -30,6 +33,16 @@ public sealed partial class MainWindow : Window
     {
         await _historyService.LoadAsync();
         CreateHomeTab();
+        _initialized = true;
+
+        // A file may have been requested (command-line activation) before
+        // the Home tab existed — open it now so Home stays the first tab.
+        if (_pendingFilePath != null)
+        {
+            var pending = _pendingFilePath;
+            _pendingFilePath = null;
+            OpenPdfFromPath(pending);
+        }
     }
 
     private void CreateHomeTab()
@@ -98,6 +111,98 @@ public sealed partial class MainWindow : Window
             MainTabView.TabItems.Remove(tab);
         }
     }
+
+    /// <summary>
+    /// Opens a PDF from an absolute path — used for command-line activation
+    /// (file association) and paths forwarded from second instances.
+    /// </summary>
+    public void OpenPdfFromPath(string filePath)
+    {
+        if (!_initialized)
+        {
+            _pendingFilePath = filePath;
+            return;
+        }
+
+        if (!File.Exists(filePath))
+        {
+            ShowFileNotFoundDialog(filePath);
+            return;
+        }
+
+        OpenPdfInTab(filePath, Path.GetFileName(filePath));
+    }
+
+    /// <summary>
+    /// Brings the window to the foreground. Plain Activate() is often
+    /// blocked by the OS foreground lock when the request comes from a
+    /// background context (e.g. a second instance forwarding a file).
+    /// </summary>
+    public void BringToForeground()
+    {
+        Activate();
+
+        var hwnd = WindowNative.GetWindowHandle(this);
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (IsIconic(hwnd))
+        {
+            ShowWindow(hwnd, SwRestore);
+        }
+
+        // Attach to the foreground thread's input queue so
+        // SetForegroundWindow is allowed to take focus.
+        var foregroundHwnd = GetForegroundWindow();
+        var currentThread = GetCurrentThreadId();
+        var foregroundThread = GetWindowThreadProcessId(foregroundHwnd, IntPtr.Zero);
+
+        if (foregroundThread != currentThread)
+        {
+            AttachThreadInput(currentThread, foregroundThread, true);
+        }
+
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+
+        if (foregroundThread != currentThread)
+        {
+            AttachThreadInput(currentThread, foregroundThread, false);
+        }
+    }
+
+    private const int SwRestore = 9;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 
     private void OpenPdfInTab(string filePath, string fileName)
     {
