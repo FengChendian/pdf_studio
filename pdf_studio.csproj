@@ -34,23 +34,12 @@
     <Manifest Include="$(ApplicationManifest)" />
   </ItemGroup>
 
-  <ItemGroup>
-    <!-- Only the worker executable — native DLLs (mupdfcpp64, mupdfcsharp, libSkiaSharp)
-         are provided by NuGet v3.2.16 at the output root. Both main app and worker now
-         use the same version, so no separate DLL copies needed. -->
-    <Content Include="PdfRenderCLI\pdf_rendering.exe">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>PdfRenderCLI\%(Filename)%(Extension)</Link>
-    </Content>
-  </ItemGroup>
-
   <!--
     Defining the "Msix" ProjectCapability here allows the Single-project MSIX Packaging
     Tools extension to be activated for this project even if the Windows App SDK Nuget
     package has not yet been restored.
   -->
-  <ItemGroup
-    Condition="'$(DisableMsixProjectCapabilityAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
+  <ItemGroup Condition="'$(DisableMsixProjectCapabilityAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
     <ProjectCapability Include="Msix" />
   </ItemGroup>
   <ItemGroup>
@@ -82,8 +71,7 @@
     Explorer "Package and Publish" context menu entry to be enabled for this project even if
     the Windows App SDK Nuget package has not yet been restored.
   -->
-  <PropertyGroup
-    Condition="'$(DisableHasPackageAndPublishMenuAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
+  <PropertyGroup Condition="'$(DisableHasPackageAndPublishMenuAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
     <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
   </PropertyGroup>
 
