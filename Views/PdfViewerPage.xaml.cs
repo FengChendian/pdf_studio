@@ -327,25 +327,179 @@ public sealed partial class PdfViewerPage : Page
         int total = VirtualizingImages.Count;
         if (total == 0)
         {
-            PageIndicator.Text = "– / –";
+            PageNumberBox.IsEnabled = false;
+            PageTotalLabel.Text = "/ –";
+            if (!_pageBoxDirty)
+                SetPageBoxText("");
             return;
         }
 
+        PageNumberBox.IsEnabled = true;
+        PageTotalLabel.Text = $"/ {total}";
+
+        // Fit the box to the document: a 333-page PDF gets 3 digits of
+        // width and a 3-character input limit, not a 7-digit field.
+        int digits = total.ToString().Length;
+        if (PageNumberBox.MaxLength != digits)
+        {
+            PageNumberBox.MaxLength = digits;
+            // ~7.5 px per digit at 13 px font + horizontal padding slack.
+            PageNumberBox.Width = Math.Ceiling(digits * 7.5) + 14;
+        }
+
+        // Only freeze the display while there is an uncommitted edit —
+        // focus alone must not lock it, or zooming/scrolling with the box
+        // focused would leave a stale page number on screen.
+        if (!_pageBoxDirty)
+            SetPageBoxText(GetCurrentPageNumber().ToString());
+    }
+
+    /// <summary>True while the box holds uncommitted user input.</summary>
+    private bool _pageBoxDirty = false;
+
+    /// <summary>
+    /// The text most recently written by <see cref="SetPageBoxText"/>.
+    /// TextChanging does NOT reliably fire inside the Text setter (verified:
+    /// it can arrive after the setter returns), so a timing-based guard is
+    /// unreliable — instead, a change whose resulting text matches this value
+    /// is our own write; anything else is an uncommitted user edit.
+    /// </summary>
+    private string _pageBoxExpectedText = "";
+
+    /// <summary>Programmatic text update that does not mark the box dirty.</summary>
+    private void SetPageBoxText(string text)
+    {
+        // No change — don't touch the box at all; assigning Text would
+        // needlessly reset the caret/selection.
+        if (PageNumberBox.Text == text) return;
+
+        int selStart = PageNumberBox.SelectionStart;
+        int selLength = PageNumberBox.SelectionLength;
+
+        _pageBoxExpectedText = text;
+        PageNumberBox.Text = text;
+
+        // Assigning Text resets the caret to 0 — restore the previous
+        // selection, clamped to the new (possibly shorter) text.
+        PageNumberBox.SelectionStart = Math.Min(selStart, text.Length);
+        PageNumberBox.SelectionLength = Math.Min(selLength, text.Length - PageNumberBox.SelectionStart);
+    }
+
+    private void PageNumberBox_TextChanging(TextBox sender, TextBoxTextChangingEventArgs args)
+    {
+        // Content comparison, not timing: correct whether the event fires
+        // inside the setter or is delivered later.
+        if (sender.Text != _pageBoxExpectedText)
+            _pageBoxDirty = true;
+    }
+
+    /// <summary>1-based page number at the top of the viewport (0 when no document).</summary>
+    private int GetCurrentPageNumber()
+    {
+        int total = VirtualizingImages.Count;
+        if (total == 0) return 0;
+
         // Layout not done yet (page heights all zero) — report page 1.
         if ((VirtualizingImages.GetPageItem(0)?.Height ?? 0) <= 0)
-        {
-            PageIndicator.Text = $"1 / {total}";
-            return;
-        }
+            return 1;
 
         double zoom = PdfScrollViewer.ZoomFactor;
         double top = PdfScrollViewer.VerticalOffset / zoom;
 
         // Cached offsets are sorted — binary search the page containing the
         // viewport top, matching TOC navigation which aligns the page to the top.
-        int page = FindPageIndexAtOffset(top);
+        // Tolerance: ScrollTo rounds the target offset to float, so after a
+        // jump the viewport top can land an epsilon ABOVE the page top (inside
+        // the inter-page gap).  Snap those boundary cases to the page below
+        // the gap — the tolerance is far smaller than the 16 DIP spacing.
+        return FindPageIndexAtOffset(top + PageTopSnapToleranceDips) + 1;
+    }
 
-        PageIndicator.Text = $"{page + 1} / {total}";
+    /// <summary>
+    /// Distance (unzoomed DIPs) above a page top that still counts as being on
+    /// that page for the page indicator.  Absorbs float-rounding error from
+    /// ScrollView.ScrollTo without affecting mid-scroll page detection.
+    /// </summary>
+    private const double PageTopSnapToleranceDips = 2.0;
+
+    /// <summary>
+    /// Forces the page box back to the live page number, discarding any
+    /// uncommitted edit.  Used on Escape, focus loss, and after invalid input.
+    /// </summary>
+    private void ResetPageBoxToCurrentPage()
+    {
+        _pageBoxDirty = false;
+        int page = GetCurrentPageNumber();
+        SetPageBoxText(page > 0 ? page.ToString() : "");
+    }
+
+    private void PageNumberBox_BeforeTextChanging(TextBox sender, TextBoxBeforeTextChangingEventArgs args)
+    {
+        // Digits only (ASCII; char.IsDigit would also admit non-ASCII digits
+        // that int.TryParse cannot handle).  Empty stays allowed for deleting.
+        if (args.NewText.Any(c => c < '0' || c > '9'))
+            args.Cancel = true;
+    }
+
+    private async void PageNumberBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == Windows.System.VirtualKey.Enter)
+        {
+            e.Handled = true;
+            await CommitPageJumpAsync();
+        }
+        else if (e.Key == Windows.System.VirtualKey.Escape)
+        {
+            e.Handled = true;
+            ResetPageBoxToCurrentPage();
+        }
+    }
+
+    private void PageNumberBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        // Abandon uncommitted edits — show the live page number again.
+        ResetPageBoxToCurrentPage();
+    }
+
+    /// <summary>
+    /// Validates the typed page number and, when it is in range, jumps using
+    /// the same <see cref="ScrollToPage"/> path as TOC navigation.
+    /// </summary>
+    private async Task CommitPageJumpAsync()
+    {
+        int total = VirtualizingImages.Count;
+        string text = PageNumberBox.Text.Trim();
+
+        // Empty input is not a jump request — just restore the display.
+        if (text.Length == 0 || total == 0)
+        {
+            ResetPageBoxToCurrentPage();
+            return;
+        }
+
+        if (!int.TryParse(text, out int page) || page < 1 || page > total)
+        {
+            var dialog = new ContentDialog
+            {
+                Title = "页码超出范围",
+                Content = $"请输入 1 到 {total} 之间的页码。",
+                CloseButtonText = "确定",
+                XamlRoot = XamlRoot,
+            };
+            await dialog.ShowAsync();
+
+            ResetPageBoxToCurrentPage();
+            PageNumberBox.Focus(FocusState.Programmatic);
+            PageNumberBox.SelectAll();
+            return;
+        }
+
+        ScrollToPage(page - 1);
+        // The edit session ends with the jump — the indicator follows
+        // scroll/zoom again even while the box keeps focus (text selected).
+        _pageBoxDirty = false;
+        SetPageBoxText(page.ToString());
+        PageNumberBox.SelectAll();
     }
 
     /// <summary>Scrolls so that the top of <paramref name="pageIndex"/> is visible.</summary>

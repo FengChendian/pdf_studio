@@ -101,14 +101,36 @@
             Visibility="Collapsed"/>
         </StackPanel>
 
-        <!-- Right: page indicator -->
-        <TextBlock
-          x:Name="PageIndicator"
+        <!-- Right: page navigation - editable current page + total.
+             Shows the live page number while unfocused; typing digits and
+             pressing Enter jumps via the same path as TOC navigation. -->
+        <StackPanel
           Grid.Column="2"
+          Orientation="Horizontal"
           VerticalAlignment="Center"
-          FontSize="13"
-          Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-          Text="– / –"/>
+          Spacing="4">
+          <TextBox
+            x:Name="PageNumberBox"
+            Width="40"
+            MinHeight="0"
+            MinWidth="0"
+            IsEnabled="False"
+            BorderThickness="0"
+            TextAlignment="Center"
+            FontSize="13"
+            Padding="4,1"
+            BeforeTextChanging="PageNumberBox_BeforeTextChanging"
+            TextChanging="PageNumberBox_TextChanging"
+            KeyDown="PageNumberBox_KeyDown"
+            LostFocus="PageNumberBox_LostFocus"
+            ToolTipService.ToolTip="输入页码后按回车跳转"/>
+          <TextBlock
+            x:Name="PageTotalLabel"
+            VerticalAlignment="Center"
+            FontSize="13"
+            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+            Text="/ –"/>
+        </StackPanel>
       </Grid>
     </Border>
 
