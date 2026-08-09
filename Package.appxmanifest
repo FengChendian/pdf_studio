@@ -11,7 +11,7 @@
   <Identity
     Name="1ce3bcb3-db3f-4533-9480-05a4143c4368"
     Publisher="CN=fengchendian"
-    Version="1.1.7.0" />
+    Version="1.1.8.0" />
 
   <mp:PhoneIdentity PhoneProductId="1ce3bcb3-db3f-4533-9480-05a4143c4368" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 

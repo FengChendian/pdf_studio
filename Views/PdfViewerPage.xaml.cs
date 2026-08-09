@@ -246,12 +246,11 @@ public sealed partial class PdfViewerPage : Page
     //  Toolbar: TOC, highlight pen, page indicator
     // ════════════════════════════════════════════════════════════════
 
-    private void TocSplitView_PaneToggled(SplitView sender, object args)
+    private void TocToggle_Toggled(object sender, RoutedEventArgs e)
     {
-        // Pane animation changed the content width; layout/bindings may still
-        // be settling — redraw now and once more shortly after.
-        RedrawAllOverlays();
-        ScheduleOverlayRedraw();
+        TocPane.Visibility = TocToggle.IsChecked == true
+            ? Microsoft.UI.Xaml.Visibility.Visible
+            : Microsoft.UI.Xaml.Visibility.Collapsed;
     }
 
     private void HighlightPenToggle_Toggled(object sender, RoutedEventArgs e)
@@ -687,6 +686,13 @@ public sealed partial class PdfViewerPage : Page
     private void PdfScrollViewer_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         ClearSelection();
+
+        // Light-dismiss: pressing anywhere on the PDF content retracts the
+        // floating TOC pane.  The pane overlays (not resizes) the content, so
+        // closing it mid-press never shifts the layout — the press can still
+        // begin a text selection below.
+        if (TocPane.Visibility == Microsoft.UI.Xaml.Visibility.Visible)
+            TocToggle.IsChecked = false;
 
         // Highlight mode: clicking an existing highlight pops a delete flyout.
         if (_isHighlightMode && TryShowHighlightDeleteFlyout(e))

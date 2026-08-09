@@ -71,6 +71,8 @@
         <ToggleButton
           x:Name="TocToggle"
           Grid.Column="0"
+          Checked="TocToggle_Toggled"
+          Unchecked="TocToggle_Toggled"
           ToolTipService.ToolTip="目录">
           <FontIcon Glyph="&#xE8A4;"
                     FontSize="16"/>
@@ -110,18 +112,116 @@
       </Grid>
     </Border>
 
-    <!-- ══ Content: TOC pane + PDF pages ══ -->
-    <SplitView
-      Grid.Row="1"
-      x:Name="TocSplitView"
-      DisplayMode="Overlay"
-      IsPaneOpen="{Binding IsChecked, ElementName=TocToggle, Mode=TwoWay}"
-      OpenPaneLength="300"
-      PanePlacement="Left"
-      PaneOpened="TocSplitView_PaneToggled"
-      PaneClosed="TocSplitView_PaneToggled">
-      <SplitView.Pane>
-        <Grid Background="{ThemeResource LayerFillColorDefaultBrush}">
+    <!-- ══ Content: PDF pages + floating TOC pane ══ -->
+    <Grid Grid.Row="1">
+      <Grid>
+        <!-- Loading overlay -->
+        <Border x:Name="LoadingOverlay"
+                Background="Transparent">
+          <ProgressRing
+            x:Name="LoadingIndicator"
+            IsActive="True"
+            Width="40"
+            Height="40"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center"/>
+        </Border>
+
+        <!-- PDF Content -->
+        <ScrollView
+          x:Name="PdfScrollViewer"
+          Visibility="Collapsed"
+          ZoomMode="Enabled"
+          MinZoomFactor="0.25"
+          MaxZoomFactor="4.0"
+          HorizontalScrollMode="Auto"
+          VerticalScrollMode="Auto"
+          HorizontalScrollBarVisibility="Auto"
+          VerticalScrollBarVisibility="Auto"
+          HorizontalAlignment="Stretch"
+          ViewChanged="PdfScrollViewer_ViewChanged"
+          SizeChanged="PdfScrollViewer_SizeChanged">
+          <Grid x:Name="ContentGrid">
+            <!-- Page list.  Its own scrolling is disabled — it lives inside
+                 the outer ScrollView, which therefore hands it an effectively
+                 infinite viewport: every container is realized up front and
+                 the extent is exact (no average-size estimation).  High-res
+                 rendering is driven from ScrollView.ViewChanged instead of
+                 element realization (see EnsureVisiblePagesHighRes). -->
+            <ListView
+              x:Name="PagesList"
+              Margin="32,0"
+              Padding="0"
+              HorizontalAlignment="Center"
+              Background="Transparent"
+              BorderThickness="0"
+              IsItemClickEnabled="False"
+              IsTabStop="False"
+              ItemContainerStyle="{StaticResource PageItemContainerStyle}"
+              ItemsSource="{x:Bind VirtualizingImages, Mode=OneWay}"
+              ScrollViewer.HorizontalScrollBarVisibility="Hidden"
+              ScrollViewer.HorizontalScrollMode="Disabled"
+              ScrollViewer.VerticalScrollBarVisibility="Hidden"
+              ScrollViewer.VerticalScrollMode="Disabled"
+              ScrollViewer.ZoomMode="Disabled"
+              SelectionMode="None">
+              <!-- No entrance/content transitions — a high-res bitmap swap
+                   must replace the placeholder instantly, not fade in. -->
+              <ListView.ItemContainerTransitions>
+                <ContentThemeTransition/>
+              </ListView.ItemContainerTransitions>
+
+              <ListView.ItemTemplate>
+                <DataTemplate>
+                  <Border Width="{Binding ContainerWidth}">
+                    <Image Source="{Binding Image}"
+                           Width="{Binding Width}"
+                           Height="{Binding Height}"
+                           Stretch="Uniform"
+                           HorizontalAlignment="Center"/>
+                  </Border>
+                </DataTemplate>
+              </ListView.ItemTemplate>
+            </ListView>
+
+            <!-- Persistent highlight overlay. Hosts composition SpriteVisuals
+                 with a Win2D Multiply BlendEffect against a backdrop brush,
+                 so black text stays black. IsHitTestVisible="False" so pointer
+                 events pass through to ScrollView. -->
+            <Canvas
+              x:Name="PersistentHighlightOverlay"
+              IsHitTestVisible="False"
+              HorizontalAlignment="Stretch"
+              VerticalAlignment="Stretch"/>
+
+            <!-- Text-selection highlight overlay — drawn on top of all pages.
+                 IsHitTestVisible="False" so pointer events pass through to ScrollView. -->
+            <Canvas
+              x:Name="HighlightOverlay"
+              IsHitTestVisible="False"
+              HorizontalAlignment="Stretch"
+              VerticalAlignment="Stretch"/>
+          </Grid>
+        </ScrollView>
+      </Grid>
+
+      <!-- TOC pane: a plain floating panel above the PDF content.  Unlike
+           SplitView's overlay mode it only hit-tests within its own bounds,
+           so scrolling and text selection keep working everywhere else. -->
+      <Border
+        x:Name="TocPane"
+        Width="300"
+        HorizontalAlignment="Left"
+        Background="{ThemeResource AcrylicInAppFillColorDefaultBrush}"
+        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+        BorderThickness="0,0,1,0"
+        Visibility="Collapsed">
+        <Border.Transitions>
+          <TransitionCollection>
+            <EdgeUIThemeTransition Edge="Left"/>
+          </TransitionCollection>
+        </Border.Transitions>
+        <Grid>
           <TreeView
             x:Name="TocTree"
             x:FieldModifier="public"
@@ -136,100 +236,7 @@
             VerticalAlignment="Center"
             Visibility="Collapsed"/>
         </Grid>
-      </SplitView.Pane>
-
-      <SplitView.Content>
-        <Grid>
-          <!-- Loading overlay -->
-          <Border x:Name="LoadingOverlay"
-                  Background="Transparent">
-            <ProgressRing
-              x:Name="LoadingIndicator"
-              IsActive="True"
-              Width="40"
-              Height="40"
-              HorizontalAlignment="Center"
-              VerticalAlignment="Center"/>
-          </Border>
-
-          <!-- PDF Content -->
-          <ScrollView
-            x:Name="PdfScrollViewer"
-            Visibility="Collapsed"
-            ZoomMode="Enabled"
-            MinZoomFactor="0.25"
-            MaxZoomFactor="4.0"
-            HorizontalScrollMode="Auto"
-            VerticalScrollMode="Auto"
-            HorizontalScrollBarVisibility="Auto"
-            VerticalScrollBarVisibility="Auto"
-            HorizontalAlignment="Stretch"
-            ViewChanged="PdfScrollViewer_ViewChanged"
-            SizeChanged="PdfScrollViewer_SizeChanged">
-            <Grid x:Name="ContentGrid">
-              <!-- Page list.  Its own scrolling is disabled — it lives inside
-                   the outer ScrollView, which therefore hands it an effectively
-                   infinite viewport: every container is realized up front and
-                   the extent is exact (no average-size estimation).  High-res
-                   rendering is driven from ScrollView.ViewChanged instead of
-                   element realization (see EnsureVisiblePagesHighRes). -->
-              <ListView
-                x:Name="PagesList"
-                Margin="32,0"
-                Padding="0"
-                HorizontalAlignment="Center"
-                Background="Transparent"
-                BorderThickness="0"
-                IsItemClickEnabled="False"
-                IsTabStop="False"
-                ItemContainerStyle="{StaticResource PageItemContainerStyle}"
-                ItemsSource="{x:Bind VirtualizingImages, Mode=OneWay}"
-                ScrollViewer.HorizontalScrollBarVisibility="Hidden"
-                ScrollViewer.HorizontalScrollMode="Disabled"
-                ScrollViewer.VerticalScrollBarVisibility="Hidden"
-                ScrollViewer.VerticalScrollMode="Disabled"
-                ScrollViewer.ZoomMode="Disabled"
-                SelectionMode="None">
-                <!-- No entrance/content transitions — a high-res bitmap swap
-                     must replace the placeholder instantly, not fade in. -->
-                <ListView.ItemContainerTransitions>
-                  <ContentThemeTransition/>
-                </ListView.ItemContainerTransitions>
-
-                <ListView.ItemTemplate>
-                  <DataTemplate>
-                    <Border Width="{Binding ContainerWidth}">
-                      <Image Source="{Binding Image}"
-                             Width="{Binding Width}"
-                             Height="{Binding Height}"
-                             Stretch="Uniform"
-                             HorizontalAlignment="Center"/>
-                    </Border>
-                  </DataTemplate>
-                </ListView.ItemTemplate>
-              </ListView>
-
-              <!-- Persistent highlight overlay. Hosts composition SpriteVisuals
-                   with a Win2D Multiply BlendEffect against a backdrop brush,
-                   so black text stays black. IsHitTestVisible="False" so pointer
-                   events pass through to ScrollView. -->
-              <Canvas
-                x:Name="PersistentHighlightOverlay"
-                IsHitTestVisible="False"
-                HorizontalAlignment="Stretch"
-                VerticalAlignment="Stretch"/>
-
-              <!-- Text-selection highlight overlay — drawn on top of all pages.
-                   IsHitTestVisible="False" so pointer events pass through to ScrollView. -->
-              <Canvas
-                x:Name="HighlightOverlay"
-                IsHitTestVisible="False"
-                HorizontalAlignment="Stretch"
-                VerticalAlignment="Stretch"/>
-            </Grid>
-          </ScrollView>
-        </Grid>
-      </SplitView.Content>
-    </SplitView>
+      </Border>
+    </Grid>
   </Grid>
 </Page>
